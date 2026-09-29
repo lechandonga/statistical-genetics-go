@@ -5,8 +5,10 @@
 在**等位基因方向不一致、数据缺失、样本重叠**等非理想条件下，给出
 可解释、可复现的结果。
 
-纯 Go 标准库实现（无第三方数值依赖），数值层通过 `numwrap` 对后端
-版本与错误类型做归一化封装。
+数值层 `numwrap` 同时编译两套相互独立的实现：Go 标准库后端
+`stdlib`（默认）与成熟第三方线代库 gonum 后端 `gonum`。依赖版本在
+仓库中锁定并 `vendor/` 入库，断网可构建；可按次命令行选择后端，
+也可用交叉验证模式要求两个后端对同一份输入给出一致结论。
 
 ## 能力一览
 
@@ -26,15 +28,23 @@
   评分尺度的审计记录。
 - **并发可复现**：确定性分片 + 固定顺序 Kahan 归约，任意并行度结果
   与串行**逐位一致**；`-race` 安全；失败不返回半更新结果。
-- **可配置上限**：变体数、样本数、行/文件字节、墙钟耗时；超限可拒绝
-  或截断，不残留部分统计状态。
+- **双实现交叉验证**：`-backend stdlib|gonum` 按次选择，`-crosscheck`
+  两侧各完整计算一遍——同后端逐位一致，跨后端在声明容差（rel 1e-9 /
+  abs 1e-12）内一致，且“是否拒绝/标记/纳入”等离散判定必须完全一致；
+  对不上即硬报错，绝不挑一侧结果。
+- **可配置输入预算**：按输入类型开放变体数、样本数、行/文件字节、
+  墙钟耗时上限（`-max-*`、`-limit-policy reject|truncate`），设了即
+  真实生效；每类输入跑完都打印用量小结（字节/行/变体/样本/耗时）。
+- **混合来源元分析**：仅有 Z 值与样本量的队列默认按统一口径换算后
+  真正参与合并（不一律排除）；只有缺样本量或 Z 无法定向时才以可区分
+  原因排除；每变体的参与队列、权重、方向依据与排除原因都在审计列输出。
 
 ## 包结构
 
 ```
 variant/           统一变体模型、等位基因对齐、拒绝原因代码
 ingest/            TSV 解析（汇总统计/LD 分数/基因型矩阵）、上限与报告
-numwrap/           数值后端归一化（stdlib；gonum 预留为显式不支持）
+numwrap/           数值后端归一化（stdlib + gonum，交叉验证与错误翻译）
 stats/             h2.go 遗传力 / meta.go 元分析 / prs.go 风险评分
                    parallel.go 确定性分片并行
 internal/simulate/ 固定种子的确定性测试数据生成器
@@ -48,8 +58,9 @@ docs/              model.md（模型/对齐规则）、compatibility.md、verifi
 ```sh
 go build -o sggo ./cmd/sggo
 ./sggo simulate -out testdata -variants 500 -samples 300 -overlap 80
-./sggo h2   -sum testdata/cohort1_sumstats.tsv -ld testdata/ldscores.tsv -n 280
-./sggo meta -in c1=testdata/cohort1_sumstats.tsv -in c2=testdata/cohort2_sumstats.tsv
+./sggo h2   -sum testdata/cohort1_sumstats.tsv -ld testdata/ldscores.tsv -n 280 \
+           -backend gonum -crosscheck
+./sggo meta -in c1=testdata/cohort1_sumstats.tsv -in c2=testdata/cohort2_sumstats.tsv::z
 ./sggo prs  -sum testdata/cohort1_sumstats.tsv -gt testdata/genotypes.tsv \
             -n 280 -missing-sites ignore -scale std -out testdata/prs.tsv
 ```
@@ -59,6 +70,8 @@ go build -o sggo ./cmd/sggo
 ```sh
 go vet ./...
 go test ./... -race -count=1
+# 断网可复现（依赖已 vendor、go.sum 锁定）
+GOPROXY=off GOFLAGS=-mod=vendor go test ./... -race -count=1
 ```
 
 测试以边界与异常数据为主（链翻转、模糊位点、负遗传力、队列重叠、
@@ -76,7 +89,12 @@ go test ./... -race -count=1
 ## 范围与限制（明确不做）
 
 - 不联网、不读取压缩文件（gzip）/Parquet/VCF；仅本地未压缩 TSV。
+- 第三方依赖仅 `gonum.org/v1/gonum v0.15.1`（+ 其 `golang.org/x/exp`
+  传递依赖），版本在 `go.mod`/`go.sum`/`vendor/modules.txt` 三处锁定，
+  `TestGonumVersionPinned` 强制三者一致。
 - 不实现 LD 分数本身的估计（r² 矩阵计算），LD 分数为输入。
 - 随机效应仅 DL；REML、协变量调整的 PRS 评估、多表型留待后续，
   当前请求这些选项会被显式拒绝。
 - 异质性 P 值用 Wilson–Hilferty 近似（文档中已标注，非精确卡方）。
+- 跨后端只保证落在声明容差内，不承诺逐位相同；同一后端重复运行承诺
+  逐位一致。交叉验证不通过时任务整体失败，没有“选一边继续”的路径。

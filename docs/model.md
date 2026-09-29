@@ -5,6 +5,10 @@
 
 ## 1. 统一变体模型（`variant.Variant`）
 
+本版本新增三类能力，规则一并固化在本文件中：双数值后端与交叉验证
+（见 §6）、可配置输入预算与用量小结（见 §7）、混合来源队列的
+Z-only 换算口径（见 §4.1）。
+
 所有输入（汇总统计、LD 分数、基因型矩阵）都先归一化到同一结构：
 
 | 字段 | 含义 | 归一化规则 |
@@ -136,6 +140,43 @@ REML 后端未实现，请求 `MetaRandomREML` 会得到显式
 
 有效队列数低于 `MinCohorts`（默认 2）的变体被排除并说明原因。
 
+### 4.5 混合来源队列：Z-only 的统一换算口径
+
+完整队列（有 beta 与 SE）直接按 §4.1 参与；**仅有 Z 值与样本量 N 的
+队列默认也真正参与**，按统一口径换算成等效 (beta, se)，不一律排除：
+
+```
+p_i      = 2 * Phi(-|Z_i|)                    # 双侧 P 值
+I_i      = 2 * p_i * (1 - p_i) * N_i          # 等效 Fisher 信息量
+se_i     = 1 / sqrt(I_i)
+beta_i   = Z_i * se_i                         # Z 自带符号
+w_i      = I_i = 1/se_i^2                     # 与完整队列同一逆方差权重
+```
+
+对齐方向与完整队列完全一致：来源 Z 的符号再乘 `AlignResult.Sign`
+（互换取反、链翻转保留）。每个变体的审计行 `MetaCohortLine` 记录：
+`SourceKind`（`beta_se`/`z_only`）、`Weight`、`WeightBasis`（含换算
+公式与实际使用的 N）、`Sign`、对齐关系与 `DirectionNote`；CLI 元分析
+TSV 的 `included_cohorts`/`per_cohort_detail`/`excluded_detail` 三列
+直接展示这些内容。
+
+只有以下情况才排除该队列在该变体的贡献，并给出**可区分**原因：
+
+| 情况 | Reason 代码 |
+| --- | --- |
+| 缺换算所需样本量（N 列与 FallbackN 都没有，N<=0） | `missing_sample_size` |
+| Z 为 NaN/Inf | `z_not_finite` |
+| Z 恰好为 0：效应方向不存在 | `z_undirected` |
+| 换算信息量非有限（极端 P/N） | `z_conversion_non_finite` |
+| 对齐失败/链模糊/缺该变体等 | 沿用 §2 的既有原因 |
+
+硬保证：凡出现在合并结果里的数值（beta/se/P/CI/Q/I²/权重）必须有限；
+若后端数值异常则该变体以 `numerical_backend_error` 或
+`non_finite_combined_result` 整体排除并标记，不存在“参与了合并、
+结果却无法解释、又没有任何标记”的条目。参与队列数不足 `MinCohorts`
+时，变体以 `insufficient_cohorts`（完全没有可对齐队列时为
+`no_alignable_cohort`）排除。
+
 ## 5. 个体风险评分（`stats.BuildPRS`）
 
 方向基准是个体基因型矩阵。每个模型位点对齐后：
@@ -174,6 +215,39 @@ raw score_j = Σ_i beta_i(aligned) * dosage_ij
 
 `ingest.Limits`：`MaxVariants`、`MaxSamples`、`MaxLineBytes`、
 `MaxFileBytes`、`MaxElapsed`，默认值见 `DefaultLimits()`。
+
+三类输入（汇总统计、LD 分数、基因型矩阵）的上限均可在 CLI 按次设置：
+`-max-variants`、`-max-samples`（仅基因型样本列）、`-max-line-bytes`、
+`-max-file-bytes`、`-max-elapsed`，配合 `-limit-policy reject|truncate`。
+
+- **真实生效**：字节上限在读入路径上累计并在到达上限时立即中止；
+  行上限按物理数据行计数；样本列上限作用于表头识别出的样本列；
+  墙钟上限在每次取行前检查。
+- **reject（默认）**：整体失败，返回 nil 结果，不落任何半截输出文件
+  （CLI 在解析成功后才创建分析输出）。
+- **truncate**：确定性保留文件/表头顺序的前 N 行或前 N 个样本列，
+  报告 `Truncated=true`、`TruncateAt=N` 与命中的上限名。
+- **用量小结**：每次解析把实际 `BytesRead/Lines/Variants/Samples/
+  Elapsed` 写进对应 `ParseReport.Usage`，CLI 在 stderr 打印；
+  Usage 是每次解析的独立实例，并发任务之间不共享。
+
+## 8. 双数值后端与交叉验证语义
+
+- 后端：`stdlib`（默认，Go 标准库 math + Kahan）与 `gonum`
+  （gonum/gonum 线代库，版本锁定见 `docs/compatibility.md`）。
+- 选择粒度：进程默认（`numwrap.SetDefaultBackend`，加锁）与
+  **按次显式选择**（各 Options.Backend / CLI `-backend`）。
+  按次选择在入口解析一次后贯穿整个任务；切换默认后端不会打断、
+  改变任何在跑的任务，也不存在半切换状态。
+- 复现性：同一后端对同一输入（含相同并行度以外的任意并行度）
+  **逐位一致**；两个后端之间只要求在声明容差内一致
+  （rel `1e-9`、abs `1e-12`，见 `numwrap` 常量）。
+- 判定一致性：交叉验证不仅比数值，还比所有离散结论——h2 flags、
+  变体/队列纳入与排除原因、来源类型、PRS active 计数等必须完全相同。
+- 失败语义：容差超限或判定不一致 => `BackendMismatchError` 硬失败；
+  未知后端 => `KindUnsupportedOption`，绝不静默回退默认实现。
+- 库错误隔离：gonum 的错误/panic 在 numwrap 内翻译为本包错误类型，
+  不透出第三方错误文本（映射表见 `docs/compatibility.md`）。
 
 - `LimitReject`（默认）：超限整体拒绝，不返回部分接受结果；
 - `LimitTruncate`：截断并在报告中记录 `Truncated/TruncateAt`。

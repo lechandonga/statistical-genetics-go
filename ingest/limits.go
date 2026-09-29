@@ -68,7 +68,32 @@ type ParseReport struct {
 	Truncated  bool
 	TruncateAt int      // Policy==LimitTruncate 时保留的行数上限
 	Columns    []string // 识别到的列
+	Usage      Usage    // 本次解析的实际用量小结（并发解析互不共享）
 	Summary    string   // 输入摘要（测试日志用）
+}
+
+// Usage 是一次解析实际消耗的输入预算，随对应 ParseReport 返回；
+// 每个解析器独立持有自己的实例，并发任务之间不会串用。
+type Usage struct {
+	BytesRead int64         // 实际从读取器消费的字节数（含表头，按解码后字节计）
+	Lines     int           // 实际读取的物理数据行数（不含表头）
+	Variants  int           // 实际接受的变体（行）数
+	Samples   int           // 实际保留的基因型样本列数（汇总/LD 输入为 0）
+	Elapsed   time.Duration // 解析墙钟耗时
+	LimitKind string        // 命中的上限名（未命中为空）
+	Truncated bool          // 是否因截断策略提前结束
+}
+
+// String 给出 CLI 直接可用的用量小结。
+func (u Usage) String() string {
+	return fmt.Sprintf("bytes=%d lines=%d variants=%d samples=%d elapsed=%s%s",
+		u.BytesRead, u.Lines, u.Variants, u.Samples, u.Elapsed,
+		func() string {
+			if u.LimitKind != "" {
+				return " limit_hit=" + u.LimitKind
+			}
+			return ""
+		}())
 }
 
 // RejectError 将 RowRef 升级为 *variant.RejectError。

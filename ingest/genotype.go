@@ -133,8 +133,20 @@ func ParseGenotype(r io.Reader, opts GenotypeOptions) (*GenotypeMatrix, error) {
 			Detail: "no sample columns detected after annotations"}
 	}
 	if opts.Limits.MaxSamples > 0 && len(sampleIdx) > opts.Limits.MaxSamples {
-		return nil, &limitExceeded{what: fmt.Sprintf("sample count %d > MaxSamples %d",
-			len(sampleIdx), opts.Limits.MaxSamples)}
+		if opts.Limits.Policy == LimitTruncate {
+			// 截断：确定性地保留表头顺序的前 MaxSamples 个样本列，
+			// 并在报告里留下可区分的截断事实。
+			sampleIdx = sampleIdx[:opts.Limits.MaxSamples]
+			report.Truncated = true
+			report.TruncateAt = opts.Limits.MaxSamples
+			report.Usage.Truncated = true
+			report.Usage.LimitKind = "MaxSamples"
+		} else {
+			report.Usage.LimitKind = "MaxSamples"
+			return nil, fmt.Errorf("source=%s: %w", opts.Source, &limitExceeded{
+				what: fmt.Sprintf("sample count %d > MaxSamples %d",
+					len(sampleIdx), opts.Limits.MaxSamples)})
+		}
 	}
 
 	out := &GenotypeMatrix{}
@@ -151,6 +163,7 @@ func ParseGenotype(r io.Reader, opts GenotypeOptions) (*GenotypeMatrix, error) {
 				break
 			}
 			if le, ok := asLimitError(rerr); ok {
+				sc.finalize(&report, len(out.Variants), nS)
 				return nil, fmt.Errorf("source=%s: %w", opts.Source, le)
 			}
 			return nil, rerr
@@ -202,6 +215,7 @@ func ParseGenotype(r io.Reader, opts GenotypeOptions) (*GenotypeMatrix, error) {
 
 	out.Report = report
 	out.Report.Accepted = len(out.Variants)
+	sc.finalize(&out.Report, len(out.Variants), nS)
 	out.Report.Summary = summarize(out.Report)
 	if !opts.Lenient {
 		if err := out.Report.Err(); err != nil {

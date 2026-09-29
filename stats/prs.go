@@ -45,6 +45,11 @@ type PRSOptions struct {
 	//	"perallele" = 除以每样本实际计入的位点数
 	ScoreScale string
 	Workers    int
+	// Backend 选择评分标准化/评估使用的数值后端；空 => numwrap 默认。
+	Backend numwrap.Backend
+	// CrossCheck=true 时 stdlib 与 gonum 各完整计算一遍并核对
+	// （评分向量、active 计数、审计离散判定必须一致）。
+	CrossCheck bool
 }
 
 // PRSVariantAudit 记录每个模型位点的使用情况。
@@ -66,6 +71,8 @@ type PRSResult struct {
 	Audit             []PRSVariantAudit
 	MissingModelSites []string
 	Scale             string
+	Backend           numwrap.Backend
+	CrossChecked      bool
 	Diag              string
 }
 
@@ -101,6 +108,13 @@ func BuildPRS(ctx context.Context, model *ingest.SummaryTable, gt *ingest.Genoty
 	}
 	if scale != "raw" && scale != "std" && scale != "perallele" {
 		return nil, &prsError{"unsupported_scale", "scale must be raw|std|perallele, got: " + scale}
+	}
+	backend := opts.Backend
+	if backend == "" {
+		backend = numwrap.DefaultBackend()
+	}
+	if !numwrap.Available(backend) {
+		return nil, &prsError{"unsupported_backend", "backend not compiled into this build: " + string(backend)}
 	}
 	if opts.Name == "" {
 		opts.Name = "prs"
@@ -258,7 +272,7 @@ func BuildPRS(ctx context.Context, model *ingest.SummaryTable, gt *ingest.Genoty
 			}
 		}
 	case "std":
-		mean, sd, err := numwrap.MeanStd(scores)
+		mean, sd, err := numwrap.MeanStdB(scores, backend)
 		if err != nil {
 			return nil, &prsError{"standardize_failed", err.Error()}
 		}
@@ -280,6 +294,23 @@ func BuildPRS(ctx context.Context, model *ingest.SummaryTable, gt *ingest.Genoty
 		Name: opts.Name, SampleIDs: append([]string(nil), gt.SampleIDs...),
 		Scores: scores, NActive: active, Audit: audit,
 		MissingModelSites: missingModel, Scale: scale,
+		Backend: backend, CrossChecked: opts.CrossCheck,
+	}
+	if opts.CrossCheck {
+		other := numwrap.BackendStd
+		if backend == numwrap.BackendStd {
+			other = numwrap.BackendGonum
+		}
+		xopts := opts
+		xopts.Backend = other
+		xopts.CrossCheck = false
+		alt, aerr := BuildPRS(ctx, model, gt, xopts)
+		if aerr != nil {
+			return nil, aerr
+		}
+		if err := crossCheckPRS(res, alt); err != nil {
+			return nil, err
+		}
 	}
 	res.Diag = fmt.Sprintf("sites_requested=%d sites_used=%d missing_sites=%d sign_flips=%d scale=%s gt_policy=%d samples=%d",
 		len(model.Records), len(sites), len(missingModel), nSignFlip, scale, opts.GT, nS)
@@ -305,6 +336,8 @@ func markAuditMissing(a []PRSVariantAudit, id string, n int) []PRSVariantAudit {
 type EvalOptions struct {
 	Phenotype  []float64   // 长度必须等于样本数，不允许 NaN/Inf
 	Covariates [][]float64 // 预留：非空即显式拒绝
+	Backend    numwrap.Backend
+	CrossCheck bool
 }
 
 // EvalResult 是评分-表型关联评估（简单线性回归 y ~ score）。
@@ -335,7 +368,12 @@ func EvaluatePRS(ctx context.Context, prs *PRSResult, opts EvalOptions) (*EvalRe
 			return nil, &prsError{"non_finite_value", fmt.Sprintf("at index %d", i)}
 		}
 	}
-	fit, err := numwrap.WLS(prs.Scores, opts.Phenotype, numwrap.RegressionOptions{InterceptFree: true})
+	backend := opts.Backend
+	if backend == "" {
+		backend = numwrap.DefaultBackend()
+	}
+	fit, err := numwrap.WLS(prs.Scores, opts.Phenotype, numwrap.RegressionOptions{
+		InterceptFree: true, Backend: backend})
 	if err != nil {
 		return nil, &prsError{"regression_failed", err.Error()}
 	}
@@ -345,11 +383,11 @@ func EvaluatePRS(ctx context.Context, prs *PRSResult, opts EvalOptions) (*EvalRe
 	p := 2 * normalSurvival(abs(z))
 
 	// R2 = corr^2，用与 WLS 一致的确定性均值/方差。
-	xm, xs, err := numwrap.MeanStd(prs.Scores)
+	xm, xs, err := numwrap.MeanStdB(prs.Scores, backend)
 	if err != nil {
 		return nil, &prsError{"moments_failed", err.Error()}
 	}
-	ym, ys, err := numwrap.MeanStd(opts.Phenotype)
+	ym, ys, err := numwrap.MeanStdB(opts.Phenotype, backend)
 	if err != nil {
 		return nil, &prsError{"moments_failed", err.Error()}
 	}
@@ -369,7 +407,31 @@ func EvaluatePRS(ctx context.Context, prs *PRSResult, opts EvalOptions) (*EvalRe
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return &EvalResult{Beta: beta, SE: se, P: p, R2: r2, N: n}, nil
+	res := &EvalResult{Beta: beta, SE: se, P: p, R2: r2, N: n}
+	if opts.CrossCheck {
+		other := numwrap.BackendStd
+		if backend == numwrap.BackendStd {
+			other = numwrap.BackendGonum
+		}
+		xo := opts
+		xo.Backend = other
+		xo.CrossCheck = false
+		alt, aerr := EvaluatePRS(ctx, prs, xo)
+		if aerr != nil {
+			return nil, aerr
+		}
+		for _, c := range []struct {
+			name string
+			x, y float64
+		}{
+			{"beta", res.Beta, alt.Beta}, {"se", res.SE, alt.SE},
+			{"p", res.P, alt.P}, {"r2", res.R2, alt.R2}} {
+			if err := numwrap.CrossCheckScalar(crossCheckOp, "eval."+c.name, c.x, c.y); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return res, nil
 }
 
 func nonFinite(v float64) bool { return math.IsNaN(v) || math.IsInf(v, 0) }

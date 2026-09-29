@@ -19,6 +19,20 @@ const (
 	EffectZ                       // 仅提供 Z 分数（退化模式，无 SE 反演）
 )
 
+// String 返回效应字段类型的 CLI 可读名称。
+func (e EffectField) String() string {
+	switch e {
+	case EffectBeta:
+		return "beta"
+	case EffectOR:
+		return "or"
+	case EffectZ:
+		return "z"
+	default:
+		return "unknown"
+	}
+}
+
 // ColumnMap 定义列名覆盖；空字符串使用内置默认别名集合。
 type ColumnMap struct {
 	ID     string
@@ -100,6 +114,7 @@ func ParseSummary(r io.Reader, opts SummaryOptions) (*SummaryTable, error) {
 				break
 			}
 			if le, ok := asLimitError(rerr); ok {
+				sc.finalize(&report, len(out.Records), 0)
 				return nil, fmt.Errorf("source=%s: %w", opts.Source, le)
 			}
 			return nil, rerr
@@ -123,6 +138,7 @@ func ParseSummary(r io.Reader, opts SummaryOptions) (*SummaryTable, error) {
 
 	out.Report = report
 	out.Report.Accepted = len(out.Records)
+	sc.finalize(&out.Report, len(out.Records), 0)
 	out.Report.Summary = summarize(out.Report)
 	// 默认严格：存在拒绝即失败；opts.Strict==false 仅在显式构造时发生。
 	// 注：零值 SummaryOptions{} 不合法（Limits 等必填），因此用
@@ -357,10 +373,12 @@ func parseSummaryRow(fields [][]byte, line int, c summaryColumns, opts SummaryOp
 	if rec.N == 0 {
 		if opts.FallbackN > 0 {
 			rec.N = opts.FallbackN
-		} else {
+		} else if opts.Effect != EffectZ {
 			return SummaryRecord{}, &rowError{id: id, line: line,
 				reason: variant.ReasonMissingField, detail: "sample size N missing and no FallbackN configured"}
 		}
+		// Z 模式允许缺 N：该行在元分析里以 missing_sample_size 原因按变体排除，
+		// 不拖垮整个文件；h2/PRS 仍会在各自入口要求可用 N。
 	}
 
 	return rec, nil

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/lechandonga/statistical-genetics-go/ingest"
+	"github.com/lechandonga/statistical-genetics-go/numwrap"
 	"github.com/lechandonga/statistical-genetics-go/stats"
 	"github.com/lechandonga/statistical-genetics-go/variant"
 )
@@ -30,6 +31,10 @@ type Config struct {
 	// EffectField / FallbackN：汇总统计解析的共享设置。
 	Effect    ingest.EffectField
 	FallbackN float64
+	// Backend 选择本次流程的数值后端；CrossCheck=true 时两侧各跑一遍
+	// 并要求数值在声明容差内、离散判定完全一致，否则整体失败。
+	Backend    numwrap.Backend
+	CrossCheck bool
 	// EnableH2/Meta/PRS 控制执行阶段（至少启用一个）。
 	EnableH2, EnableMeta, EnablePRS bool
 	// PRS 基因型编码（默认 0/1/2 剂量）。
@@ -68,6 +73,8 @@ type SummaryInput struct {
 	N      int
 	// SampleIDPath 可选：每行一个样本 ID，用于队列重叠硬证据。
 	SampleIDPath string
+	// Effect 可选：beta|or|z；空 => 按 cfg.Effect。
+	Effect string
 }
 
 // Result 是完整流程输出（成功时为完整快照，失败时为零值 + 错误）。
@@ -110,10 +117,23 @@ func Run(ctx context.Context, in Input, cfg Config) (*Result, error) {
 	cohorts := make([]stats.Cohort, 0, len(in.Summaries))
 	reports := []*ingest.ParseReport{}
 	for i, si := range in.Summaries {
+		effect := cfg.Effect
+		switch si.Effect {
+		case "":
+		case "beta":
+			effect = ingest.EffectBeta
+		case "or":
+			effect = ingest.EffectOR
+		case "z":
+			effect = ingest.EffectZ
+		default:
+			return nil, &pipelineError{stage: "config",
+				err: fmt.Errorf("cohort %s: effect kind must be beta|or|z, got %q", si.Cohort, si.Effect)}
+		}
 		tbl, err := parseFile(si.Path, func(f *os.File) (*ingest.SummaryTable, error) {
 			return ingest.ParseSummary(f, ingest.SummaryOptions{
 				Source:    si.Path,
-				Effect:    cfg.Effect,
+				Effect:    effect,
 				FallbackN: float64(si.N),
 				Limits:    cfg.Limits,
 			})
@@ -163,6 +183,8 @@ func Run(ctx context.Context, in Input, cfg Config) (*Result, error) {
 		reports = append(reports, &rep)
 		h2opts := cfg.H2
 		h2opts.Align = cfg.Align
+		h2opts.Backend = cfg.Backend
+		h2opts.CrossCheck = cfg.CrossCheck
 		if cfg.Workers > 0 {
 			h2opts.Workers = cfg.Workers
 		}
@@ -181,6 +203,8 @@ func Run(ctx context.Context, in Input, cfg Config) (*Result, error) {
 		}
 		mopts := cfg.Meta
 		mopts.Align = cfg.Align
+		mopts.Backend = cfg.Backend
+		mopts.CrossCheck = cfg.CrossCheck
 		if cfg.Workers > 0 {
 			mopts.Workers = cfg.Workers
 		}
@@ -208,6 +232,8 @@ func Run(ctx context.Context, in Input, cfg Config) (*Result, error) {
 		reports = append(reports, &rep)
 		popts := cfg.PRS
 		popts.Align = cfg.Align
+		popts.Backend = cfg.Backend
+		popts.CrossCheck = cfg.CrossCheck
 		if cfg.Workers > 0 {
 			popts.Workers = cfg.Workers
 		}

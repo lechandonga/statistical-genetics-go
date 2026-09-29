@@ -10,6 +10,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -46,9 +48,14 @@ func run(args []string) error {
 	case "prs":
 		return cmdPRS(args[1:])
 	case "version":
-		v, _ := numwrap.Version(numwrap.DefaultBackend())
-		fmt.Printf("sggo dev\ngo-module: github.com/lechandonga/statistical-genetics-go\nnumerical backend: %s (%s)\n",
-			numwrap.DefaultBackend(), v)
+		fmt.Printf("sggo dev\ngo-module: github.com/lechandonga/statistical-genetics-go\n")
+		fmt.Printf("default numerical backend: %s\n", numwrap.DefaultBackend())
+		for _, b := range numwrap.AvailableBackends() {
+			v, _ := numwrap.Version(b)
+			fmt.Printf("backend: %-7s %s\n", b, v)
+		}
+		fmt.Printf("cross-backend tolerance: rel=%.0e abs=%.0e\n",
+			numwrap.CrossCheckRelTol, numwrap.CrossCheckAbsTol)
 		return nil
 	default:
 		usage()
@@ -98,25 +105,106 @@ func cmdSimulate(args []string) error {
 	return nil
 }
 
-func openSummary(path string, n float64) (*ingest.SummaryTable, error) {
+// parseBackend 把 -backend 文本解析为已编译后端；
+// 未知/未编译后端显式报错，绝不静默退回默认实现。
+func parseBackend(name string) (numwrap.Backend, error) {
+	if name == "" || name == string(numwrap.DefaultBackend()) {
+		return numwrap.DefaultBackend(), nil
+	}
+	b := numwrap.Backend(name)
+	if !numwrap.Available(b) {
+		return "", fmt.Errorf("unsupported backend %q (available: stdlib, gonum); "+
+			"no silent fallback to the default", name)
+	}
+	return b, nil
+}
+
+// limitFlags 注册三类输入共用的规模上限 flag，返回 *ingest.Limits 与 policy 文本。
+func limitFlags(fs *flag.FlagSet) (*ingest.Limits, *string) {
+	lim := ingest.DefaultLimits()
+	fs.IntVar(&lim.MaxVariants, "max-variants", lim.MaxVariants, "max accepted variant rows")
+	fs.IntVar(&lim.MaxSamples, "max-samples", lim.MaxSamples, "max genotype sample columns")
+	fs.Int64Var(&lim.MaxLineBytes, "max-line-bytes", lim.MaxLineBytes, "max bytes per line")
+	fs.Int64Var(&lim.MaxFileBytes, "max-file-bytes", lim.MaxFileBytes, "max bytes read per input file")
+	fs.DurationVar(&lim.MaxElapsed, "max-elapsed", lim.MaxElapsed, "wall-clock budget per input file")
+	policy := fs.String("limit-policy", "reject", "reject (fail whole input) or truncate (keep first N)")
+	return &lim, policy
+}
+
+func applyPolicy(lim *ingest.Limits, policy string) error {
+	switch policy {
+	case "reject":
+		lim.Policy = ingest.LimitReject
+	case "truncate":
+		lim.Policy = ingest.LimitTruncate
+	default:
+		return fmt.Errorf("unsupported limit-policy %q", policy)
+	}
+	return nil
+}
+
+// detectOrChooseEffect 选择汇总统计的效应字段类型：
+// 显式给出（beta/or/z）时严格采用；否则按表头自动识别
+// （有 SE 列 => beta；仅有 Z 列 => z-only）。
+func detectOrChooseEffect(path, explicit string) (ingest.EffectField, error) {
+	switch explicit {
+	case "beta":
+		return ingest.EffectBeta, nil
+	case "or":
+		return ingest.EffectOR, nil
+	case "z":
+		return ingest.EffectZ, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	br := bufio.NewReader(f)
+	line, _, err := br.ReadLine()
+	if err != nil {
+		return 0, fmt.Errorf("%s: cannot read header: %w", path, err)
+	}
+	has := func(names ...string) bool {
+		for _, f := range bytes.FieldsFunc(line, func(r rune) bool { return r == '\t' }) {
+			n := strings.ToLower(strings.TrimSpace(string(f)))
+			n = strings.NewReplacer("_", "", ".", "", "-", "", " ", "").Replace(n)
+			for _, want := range names {
+				if n == want {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	switch {
+	case has("or", "oddsratio"):
+		return ingest.EffectOR, nil
+	case has("z", "zscore") && !has("se", "sebeta", "standarderror", "stderr"):
+		return ingest.EffectZ, nil
+	default:
+		return ingest.EffectBeta, nil
+	}
+}
+
+func openSummary(path string, n float64, effect ingest.EffectField, lim ingest.Limits) (*ingest.SummaryTable, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 	return ingest.ParseSummary(f, ingest.SummaryOptions{
-		Source: path, Effect: ingest.EffectBeta, FallbackN: n,
-		Limits: ingest.DefaultLimits(),
+		Source: path, Effect: effect, FallbackN: n, Limits: lim,
 	})
 }
 
-func openLD(path string) (*ingest.LDScoreTable, error) {
+func openLD(path string, lim ingest.Limits) (*ingest.LDScoreTable, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	return ingest.ParseLDScores(f, ingest.LDSOptions{Source: path, Limits: ingest.DefaultLimits()})
+	return ingest.ParseLDScores(f, ingest.LDSOptions{Source: path, Limits: lim})
 }
 
 func cmdH2(args []string) error {
@@ -127,20 +215,32 @@ func cmdH2(args []string) error {
 	free := fs.Bool("free-intercept", true, "estimate intercept freely")
 	boundary := fs.String("boundary", "report", "report|clamp|reject for h2 outside [0,h2max]")
 	workers := fs.Int("workers", 1, "shard parallelism (results identical to serial)")
+	backendName := fs.String("backend", "", "stdlib|gonum (per-invocation; default does not change)")
+	crosscheck := fs.Bool("crosscheck", false, "run stdlib and gonum and require agreement within tolerance")
+	lim, policy := limitFlags(fs)
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	backend, err := parseBackend(*backendName)
+	if err != nil {
+		return err
+	}
+	if err := applyPolicy(lim, *policy); err != nil {
 		return err
 	}
 	if *sumPath == "" || *ldPath == "" {
 		return fmt.Errorf("-sum and -ld are required")
 	}
-	sum, err := openSummary(*sumPath, *n)
+	sum, err := openSummary(*sumPath, *n, ingest.EffectBeta, *lim)
 	if err != nil {
 		return err
 	}
-	ld, err := openLD(*ldPath)
+	ld, err := openLD(*ldPath, *lim)
 	if err != nil {
 		return err
 	}
+	fmt.Fprintf(os.Stderr, "usage summary: %s | %s\n", sum.Report.Usage, ld.Report.Usage)
+	fmt.Fprintf(os.Stderr, "numerical backend: %s crosscheck=%v\n", backend, *crosscheck)
 	pol := stats.H2ReportRaw
 	switch *boundary {
 	case "report":
@@ -154,6 +254,7 @@ func cmdH2(args []string) error {
 	res, err := stats.EstimateH2(context.Background(), sum, ld, stats.H2Options{
 		NBar: *n, FreeIntercept: *free, Boundary: pol,
 		Align: variant.DefaultAlignConfig(), Workers: *workers,
+		Backend: backend, CrossCheck: *crosscheck,
 	})
 	if err != nil {
 		return err
@@ -182,10 +283,20 @@ func (c *cohortFlag) Set(v string) error {
 	}
 	name, rest := v[:eq], v[eq+1:]
 	si := pipeline.SummaryInput{Cohort: name}
-	if colon := strings.Index(rest, ":"); colon >= 0 {
-		si.Path, si.SampleIDPath = rest[:colon], rest[colon+1:]
-	} else {
-		si.Path = rest
+	parts := strings.Split(rest, ":")
+	si.Path = parts[0]
+	if len(parts) >= 2 && parts[1] != "" {
+		si.SampleIDPath = parts[1]
+	}
+	if len(parts) >= 3 && parts[2] != "" {
+		// 显式效应来源：beta|or|z；不给则按表头自动识别
+		// （有 SE 列即 beta/or，仅有 Z 列即 z-only）。
+		switch parts[2] {
+		case "beta", "or", "z":
+			si.Effect = parts[2]
+		default:
+			return fmt.Errorf("cohort effect kind must be beta|or|z, got %q", parts[2])
+		}
 	}
 	*c = append(*c, si)
 	return nil
@@ -199,7 +310,18 @@ func cmdMeta(args []string) error {
 	overlap := fs.String("overlap", "flag", "flag|drop|reject")
 	workers := fs.Int("workers", 1, "parallelism (identical results)")
 	out := fs.String("out", "", "optional output TSV path")
+	backendName := fs.String("backend", "", "stdlib|gonum (per-invocation)")
+	crosscheck := fs.Bool("crosscheck", false, "run stdlib and gonum and require agreement")
+	audit := fs.Bool("audit", true, "include per-variant cohort audit columns in TSV")
+	lim, policy := limitFlags(fs)
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	backend, err := parseBackend(*backendName)
+	if err != nil {
+		return err
+	}
+	if err := applyPolicy(lim, *policy); err != nil {
 		return err
 	}
 	if len(ins) < 2 {
@@ -207,10 +329,15 @@ func cmdMeta(args []string) error {
 	}
 	cohorts := make([]stats.Cohort, 0, len(ins))
 	for _, si := range ins {
-		tbl, err := openSummary(si.Path, 0)
+		effect, err := detectOrChooseEffect(si.Path, si.Effect)
+		if err != nil {
+			return err
+		}
+		tbl, err := openSummary(si.Path, 0, effect, *lim)
 		if err != nil {
 			return fmt.Errorf("cohort %s: %w", si.Cohort, err)
 		}
+		fmt.Fprintf(os.Stderr, "cohort %s effect=%s usage: %s\n", si.Cohort, effect, tbl.Report.Usage)
 		var ids []string
 		if si.SampleIDPath != "" {
 			b, err := os.ReadFile(si.SampleIDPath)
@@ -241,17 +368,19 @@ func cmdMeta(args []string) error {
 	}
 	res, err := stats.RunMeta(context.Background(), cohorts, stats.MetaOptions{
 		Model: m, Overlap: ov, Align: variant.DefaultAlignConfig(), Workers: *workers,
+		Backend: backend, CrossCheck: *crosscheck,
 	})
 	if err != nil {
 		return err
 	}
 	fmt.Println(res.Diag)
+	fmt.Printf("backend=%s crosschecked=%v\n", res.Backend, res.CrossChecked)
 	for _, e := range res.Overlap {
 		fmt.Printf("overlap: %s/%s shared=%d jaccard=%.3f duplicate=%v\n",
 			e.CohortA, e.CohortB, e.SharedSamples, e.Jaccard, e.Duplicate)
 	}
 	if *out != "" {
-		return writeMetaTSV(*out, res)
+		return writeMetaTSV(*out, res, *audit)
 	}
 	nShow := 5
 	if len(res.Variants) < nShow {
@@ -260,25 +389,64 @@ func cmdMeta(args []string) error {
 	fmt.Println("variant\tbeta\tse\tp\tncohorts\tQ\tI2\texcluded")
 	for i := 0; i < nShow; i++ {
 		mv := res.Variants[i]
+		id := variantID(mv)
 		fmt.Printf("%s\t%.5g\t%.5g\t%.3g\t%d\t%.3f\t%.3f\t%v\n",
-			mv.V.ID, mv.Beta, mv.SE, mv.P, mv.NCohorts, mv.Q, mv.I2, mv.Excluded)
+			id, mv.Beta, mv.SE, mv.P, mv.NCohorts, mv.Q, mv.I2, mv.Excluded)
 	}
 	return nil
 }
 
-func writeMetaTSV(path string, res *stats.MetaResult) error {
+func variantID(mv stats.MetaVariant) string {
+	if mv.V != nil {
+		return mv.V.ID
+	}
+	return "<excluded:" + string(mv.ExcludeReason) + ">"
+}
+
+func writeMetaTSV(path string, res *stats.MetaResult, auditCols bool) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	fmt.Fprintln(f, "variant\tbeta\tse\tci_low\tci_high\tp\tncohorts\tQ\tdf\tpQ\tI2\ttau2\texcluded")
+	header := "variant\tbeta\tse\tci_low\tci_high\tp\tncohorts\tQ\tdf\tpQ\tI2\ttau2\texcluded"
+	if auditCols {
+		header += "\tincluded_cohorts\tper_cohort_detail\texcluded_detail"
+	}
+	fmt.Fprintln(f, header)
 	for _, mv := range res.Variants {
-		fmt.Fprintf(f, "%s\t%.10g\t%.10g\t%.10g\t%.10g\t%.6g\t%d\t%.6g\t%d\t%.6g\t%.6g\t%.6g\t%v\n",
-			mv.V.ID, mv.Beta, mv.SE, mv.CI95[0], mv.CI95[1], mv.P, mv.NCohorts,
+		fmt.Fprintf(f, "%s\t%.10g\t%.10g\t%.10g\t%.10g\t%.6g\t%d\t%.6g\t%d\t%.6g\t%.6g\t%.6g\t%v",
+			variantID(mv), mv.Beta, mv.SE, mv.CI95[0], mv.CI95[1], mv.P, mv.NCohorts,
 			mv.Q, mv.Df, mv.PQ, mv.I2, mv.Tau2, mv.Excluded)
+		if auditCols {
+			fmt.Fprintf(f, "\t%s\t%s\t%s\n",
+				strings.Join(mv.IncludedCohorts, ","),
+				encodeCohortLines(mv.PerCohort, false),
+				encodeCohortLines(mv.ExclusionLines, true))
+		} else {
+			fmt.Fprintln(f)
+		}
 	}
 	return nil
+}
+
+// encodeCohortLines 把每队列审计行编码为 TSV 单元格内的分号分隔文本：
+// 队列/来源/权重/方向依据（纳入）或队列/原因（排除）。
+func encodeCohortLines(lines []stats.MetaCohortLine, excludedOnly bool) string {
+	var parts []string
+	for _, l := range lines {
+		if excludedOnly {
+			parts = append(parts, fmt.Sprintf("%s[reason=%s]", l.Cohort, l.Reason))
+			continue
+		}
+		if l.Excluded {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf(
+			"%s[kind=%s weight=%.6g basis=%q sign=%+.0f relation=%s]",
+			l.Cohort, l.SourceKind, l.Weight, l.WeightBasis, l.Sign, l.Relation))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func cmdPRS(args []string) error {
@@ -292,13 +460,23 @@ func cmdPRS(args []string) error {
 	pthr := fs.Float64("p", 0, "P-value threshold (0 = no filter)")
 	enc := fs.String("encoding", "012", "012|acgt")
 	out := fs.String("out", "", "output TSV path (required)")
+	backendName := fs.String("backend", "", "stdlib|gonum (per-invocation)")
+	crosscheck := fs.Bool("crosscheck", false, "run stdlib and gonum and require agreement")
+	lim, policy := limitFlags(fs)
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	backend, err := parseBackend(*backendName)
+	if err != nil {
+		return err
+	}
+	if err := applyPolicy(lim, *policy); err != nil {
 		return err
 	}
 	if *sumPath == "" || *gtPath == "" || *out == "" {
 		return fmt.Errorf("-sum, -gt and -out are required")
 	}
-	model, err := openSummary(*sumPath, *n)
+	model, err := openSummary(*sumPath, *n, ingest.EffectBeta, *lim)
 	if err != nil {
 		return err
 	}
@@ -314,11 +492,13 @@ func cmdPRS(args []string) error {
 		return fmt.Errorf("unsupported encoding %q", *enc)
 	}
 	gt, err := ingest.ParseGenotype(f, ingest.GenotypeOptions{
-		Source: *gtPath, Encoding: encoding, Limits: ingest.DefaultLimits()})
+		Source: *gtPath, Encoding: encoding, Limits: *lim})
 	f.Close()
 	if err != nil {
 		return err
 	}
+	fmt.Fprintf(os.Stderr, "usage summary: %s | %s\n", model.Report.Usage, gt.Report.Usage)
+	fmt.Fprintf(os.Stderr, "numerical backend: %s crosscheck=%v\n", backend, *crosscheck)
 	mp := stats.ModelStrict
 	if *missingModel == "ignore" {
 		mp = stats.ModelIgnore
@@ -333,7 +513,7 @@ func cmdPRS(args []string) error {
 	}
 	res, err := stats.BuildPRS(context.Background(), model, gt, stats.PRSOptions{
 		ScoreScale: *scale, Model: mp, GT: gp, PThreshold: *pthr,
-		Align: variant.DefaultAlignConfig(),
+		Align: variant.DefaultAlignConfig(), Backend: backend, CrossCheck: *crosscheck,
 	})
 	if err != nil {
 		return err

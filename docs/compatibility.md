@@ -2,17 +2,51 @@
 
 ## 数值/统计后端（`numwrap`）
 
-当前构建只包含一个后端：
+当前构建编译进两个相互独立的后端：
 
 | 后端 | 版本/来源 | 状态 |
 | --- | --- | --- |
 | `stdlib` | Go 标准库 `math`（go1.25+ 工具链） | 默认，自包含，无第三方依赖 |
-| `gonum` | gonum/gonum | **未编译**：请求即 `KindUnsupportedOption` |
+| `gonum` | `gonum.org/v1/gonum v0.15.1` | 已编译，经 `vendor/` 锁定离线可用 |
 
-`numwrap.Version(backend)` 返回后端版本/接口描述；
+gonum 锁定版本同时出现在三处并由测试强制一致：
+
+- `go.mod` / `go.sum`（校验和）
+- `vendor/modules.txt` 与 `vendor/` 源码树
+- `numwrap.GonumVersion` 常量（`numwrap.Version("gonum")` 输出它）
+
+断网复现方式：
+
+```sh
+GOPROXY=off GOFLAGS=-mod=vendor go build ./...
+GOPROXY=off GOFLAGS=-mod=vendor go test ./... -race
+```
+
+`numwrap.Version(backend)` 返回版本/接口描述；
+`numwrap.AvailableBackends()` 列出实际编译的后端；
 `SetDefaultBackend` 是进程级、加锁的切换，只影响之后新建的求解器。
-对外 API 不返回任何第三方库类型；即使将来接入 gonum，其错误也会被
-翻译成下列本包错误类型。
+**所有统计入口同时支持按次显式指定后端**（`H2Options.Backend`、
+`MetaOptions.Backend`、`PRSOptions.Backend`/`EvalOptions.Backend`、
+CLI `-backend`），入口处解析一次即贯穿整个任务，运行期间切换进程默认
+后端不会影响在跑的任务，也不存在“算了一半换后端”的状态。
+请求未编译/拼错的后端返回 `KindUnsupportedOption`，绝不静默回退默认。
+
+对外 API 不返回任何第三方库类型；gonum 的错误或 panic 都被翻译成
+下列本包错误类型（第三方错误文本不向外透出）。
+
+### 双后端交叉验证
+
+`CrossCheck=true`（CLI `-crosscheck`）时，同一输入分别用 `stdlib` 与
+`gonum` 完整计算两遍：
+
+- 同一后端重复运行：**逐位一致**（固定顺序求和/求解）。
+- 两个后端之间：数值差异必须满足
+  `|a-b| <= 1e-12 + 1e-9*max(|a|,|b|,1)`
+  （`numwrap.CrossCheckRelTol` / `CrossCheckAbsTol`）。
+- 离散判定（是否拒绝、是否标记、变体是否纳入、每个队列的纳入/排除
+  原因与来源类型、h2 flags、PRS active 计数）必须**完全一致**。
+- 任何不一致都返回 `*numwrap.BackendMismatchError`，任务整体失败；
+  不存在“挑一侧结果返回”的路径。
 
 ### 错误分类（`numwrap.Error.Kind`）
 
@@ -24,11 +58,33 @@
 | `nan` / `inf` | 输入或中间结果出现 NaN / Inf |
 | `no_convergence` | 预留给迭代算法（当前后端无迭代求解器） |
 
+另有独立类型 `*numwrap.BackendMismatchError`：交叉验证发现两后端结论
+不一致时作为硬错误返回（任务整体失败，不挑一侧结果）。
+
 封装的数值原语：
 
 - `WLS(x, y, opts)`：单自变量加权最小二乘，支持自由截距或固定截距；
 - `KahanSum` / `MeanStd`：固定顺序补偿求和，确定性矩；
 - `NormalCDFInv`：`-sqrt2 * erfcinv(2p)`，标准库实现、跨平台一致。
+- `MetaCombine(betas, ses, opts)`：固定效应 IVW + 可选 DL 随机效应；
+  stdlib 走 Kahan 求和，gonum 后端是独立的朴素顺序累加实现。
+
+gonum 后端具体映射：
+
+| 本包原语 | gonum 实现 |
+| --- | --- |
+| `WLS`（gonum） | `gonum/mat` QR 最小二乘 + `(XwᵀXw)⁻¹` 协方差 |
+| `MetaCombine`（gonum） | 独立顺序累加的 IVW/DL（不共享 std 代码） |
+| `MeanStd`（gonum） | `gonum/stat.Mean` / `stat.Variance` |
+| `NormalCDFInv`（gonum） | `gonum/stat/distuv.UnitNormal.Quantile` |
+
+### 错误翻译规则（gonum）
+
+- 维度/长度非法、权重为负、NaN/Inf 输入：**在调用 gonum 之前**由本包
+  校验拦截，直接给 `invalid_argument`/`nan`/`inf`；
+- 设计矩阵秩亏/奇异（QR 求解或信息矩阵求逆失败）：`singular`；
+- gonum 内部 panic：统一 recover 为 `singular`（线代）或
+  `invalid_argument`（分位数），错误文本只保留失败类别，不带第三方堆栈。
 
 第三方库的语法错误（例如选项拼写导致的不支持选项）与内部运行时异常
 （奇异、NaN）因此被区分为不同错误，而不是以同一字符串透出。
@@ -75,4 +131,5 @@
 ## Go 版本与模块
 
 - `go.mod` 声明 `go 1.25.0`；验证环境 `go1.26 linux/amd64`。
-- 纯标准库依赖，`go vet ./...` 与 `go test ./...` 离线可运行。
+- 唯一直接第三方依赖为 `gonum.org/v1/gonum v0.15.1`，已 vendor；
+  `go vet ./...` 与 `go test ./...` 在 `GOPROXY=off` 下离线可运行。

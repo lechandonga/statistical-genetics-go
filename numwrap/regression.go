@@ -29,23 +29,26 @@ type RegressionResult struct {
 // 结果只依赖输入数值与权重顺序：内部以固定顺序 Kahan 累加，
 // 相同输入在任何机器/并行度下逐位一致。
 func WLS(x, y []float64, opts RegressionOptions) (*RegressionResult, error) {
-	if opts.Backend == "" {
-		opts.Backend = DefaultBackend()
+	b, err := resolve(opts.Backend, "WLS")
+	if err != nil {
+		return nil, err
 	}
-	if opts.Backend != BackendStd {
-		return nil, &Error{Kind: KindUnsupportedOption, Op: "WLS",
-			Detail: "backend not available: " + string(opts.Backend)}
+	if b == BackendGonum {
+		// 复用同一套输入校验与错误分类，gonum 内部 panic 不透出。
+		if err := validateWLSInputs(x, y, opts); err != nil {
+			return nil, err
+		}
+		return wlsGonum(x, y, opts)
 	}
 	n := len(x)
 	if n != len(y) {
 		return nil, &Error{Kind: KindInvalidArgument, Op: "WLS",
 			Detail: "x/y length mismatch"}
 	}
-	hasW := len(opts.Weights) > 0
-	if hasW && len(opts.Weights) != n {
-		return nil, &Error{Kind: KindInvalidArgument, Op: "WLS",
-			Detail: "weights length mismatch"}
+	if err := validateWLSInputs(x, y, opts); err != nil {
+		return nil, err
 	}
+	hasW := len(opts.Weights) > 0
 	need := 2
 	if !opts.InterceptFree {
 		need = 1
@@ -60,19 +63,6 @@ func WLS(x, y []float64, opts RegressionOptions) (*RegressionResult, error) {
 			return opts.Weights[i]
 		}
 		return 1
-	}
-	for i := 0; i < n; i++ {
-		wi := w(i)
-		if math.IsNaN(x[i]) || math.IsNaN(y[i]) || math.IsNaN(wi) {
-			return nil, &Error{Kind: KindNaN, Op: "WLS", Detail: "NaN in inputs"}
-		}
-		if math.IsInf(x[i], 0) || math.IsInf(y[i], 0) || math.IsInf(wi, 0) {
-			return nil, &Error{Kind: KindInf, Op: "WLS", Detail: "Inf in inputs"}
-		}
-		if wi < 0 {
-			return nil, &Error{Kind: KindInvalidArgument, Op: "WLS",
-				Detail: "negative weight"}
-		}
 	}
 
 	// 固定截距：对 y' = y - c 做过原点回归。
@@ -195,9 +185,22 @@ func KahanSum(xs []float64) (float64, error) {
 
 // MeanStd 返回均值与（N-1 分母）样本标准差，单遍确定性算法。
 func MeanStd(xs []float64) (mean, std float64, err error) {
+	return MeanStdB(xs, "")
+}
+
+// MeanStdB 按指定后端计算均值与样本标准差；空后端用进程默认。
+// std 后端为顺序 Kahan 单遍矩；gonum 后端走 gonum/stat 的独立实现。
+func MeanStdB(xs []float64, b Backend) (mean, std float64, err error) {
+	backend, e := resolve(b, "MeanStd")
+	if e != nil {
+		return 0, 0, e
+	}
 	n := len(xs)
 	if n == 0 {
 		return 0, 0, &Error{Kind: KindInvalidArgument, Op: "MeanStd", Detail: "empty"}
+	}
+	if backend == BackendGonum {
+		return gonumMeanStd(xs)
 	}
 	s, e := KahanSum(xs)
 	if e != nil {
@@ -224,12 +227,24 @@ func MeanStd(xs []float64) (mean, std float64, err error) {
 
 // NormalCDFInv 标准正态分位数函数，基于 math.Erfcinv（stdlib，逐平台一致）。
 func NormalCDFInv(p float64) (float64, error) {
+	return NormalCDFInvB(p, "")
+}
+
+// NormalCDFInvB 按指定后端计算标准正态分位数；空后端用进程默认。
+func NormalCDFInvB(p float64, b Backend) (float64, error) {
+	backend, err := resolve(b, "NormalCDFInv")
+	if err != nil {
+		return 0, err
+	}
 	if math.IsNaN(p) {
 		return 0, &Error{Kind: KindNaN, Op: "NormalCDFInv"}
 	}
 	if p <= 0 || p >= 1 {
 		return 0, &Error{Kind: KindInvalidArgument, Op: "NormalCDFInv",
 			Detail: "p must be in (0,1)"}
+	}
+	if backend == BackendGonum {
+		return gonumNormalQuantile(p)
 	}
 	return -math.Sqrt2 * math.Erfcinv(2*p), nil
 }

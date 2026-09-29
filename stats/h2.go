@@ -48,6 +48,11 @@ type H2Options struct {
 	Workers int
 	// Align 控制与 LD 参考的等位基因对齐。
 	Align variant.AlignConfig
+	// Backend 选择本次估计使用的数值后端；空 => numwrap 默认。
+	Backend numwrap.Backend
+	// CrossCheck=true 时 stdlib 与 gonum 各完整计算一遍并核对：
+	// 数值须在声明容差内，离散判定（Flags、拒绝明细原因）须完全一致。
+	CrossCheck bool
 }
 
 // H2Flag 以可区分位标记描述估计过程中发生的情况。
@@ -146,6 +151,14 @@ func EstimateH2(ctx context.Context, sum *ingest.SummaryTable, ld *ingest.LDScor
 	if sum == nil || ld == nil {
 		return nil, fmt.Errorf("EstimateH2: nil input table")
 	}
+	backend := opts.Backend
+	if backend == "" {
+		backend = numwrap.DefaultBackend()
+	}
+	if !numwrap.Available(backend) {
+		return nil, &numwrap.Error{Kind: numwrap.KindUnsupportedOption, Op: "EstimateH2",
+			Detail: "backend not compiled into this build: " + string(backend)}
+	}
 	if opts.H2Max == 0 {
 		opts.H2Max = 1
 	}
@@ -225,6 +238,7 @@ func EstimateH2(ctx context.Context, sum *ingest.SummaryTable, ld *ingest.LDScor
 	if !opts.FreeIntercept {
 		wlsOpts.FixedIntercept = 1
 	}
+	wlsOpts.Backend = backend
 	fit, nerr := numwrap.WLS(xs, ys, wlsOpts)
 	if nerr != nil {
 		return nil, fmt.Errorf("h2 regression failed: %w", nerr)
@@ -260,7 +274,7 @@ func EstimateH2(ctx context.Context, sum *ingest.SummaryTable, ld *ingest.LDScor
 	h2raw := slope * M / nbar
 	h2se := slopeSE * M / nbar
 
-	z95, _ := numwrap.NormalCDFInv(0.975)
+	z95, _ := numwrap.NormalCDFInvB(0.975, backend)
 	res := &H2Result{
 		H2Raw:       h2raw,
 		H2:          h2raw,
@@ -309,6 +323,25 @@ func EstimateH2(ctx context.Context, sum *ingest.SummaryTable, ld *ingest.LDScor
 		}
 	}
 	res.Flags = flags
+	if opts.CrossCheck {
+		other := numwrap.BackendStd
+		if backend == numwrap.BackendStd {
+			other = numwrap.BackendGonum
+		}
+		xopts := opts
+		xopts.Backend = other
+		// 交叉验证始终按 report 策略跑另一侧，只核对原始量与离散判定；
+		// 截断值由主侧策略单独决定，不参与数值比对。
+		xopts.Boundary = H2ReportRaw
+		xopts.CrossCheck = false
+		alt, aerr := EstimateH2(ctx, sum, ld, xopts)
+		if aerr != nil {
+			return nil, aerr
+		}
+		if err := crossCheckH2(res, alt); err != nil {
+			return nil, err
+		}
+	}
 	res.Diag = fmt.Sprintf(
 		"model=chi2~intercept+slope*l2; M=%d Nbar=%.1f intercept=%.4f(%.4f) slope=%.6f h2raw=%.6f se=%.6f ci=[%.4f,%.4f] flags=%s; rejected=%d (ambiguous=%d)",
 		len(matched), nbar, intercept, interceptSE, slope, h2raw, h2se,

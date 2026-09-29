@@ -69,6 +69,7 @@ func ParseLDScores(r io.Reader, opts LDSOptions) (*LDScoreTable, error) {
 				break
 			}
 			if le, ok := asLimitError(rerr); ok {
+				sc.finalize(&report, len(out.Records), 0)
 				return nil, fmt.Errorf("source=%s: %w", opts.Source, le)
 			}
 			return nil, rerr
@@ -92,6 +93,7 @@ func ParseLDScores(r io.Reader, opts LDSOptions) (*LDScoreTable, error) {
 
 	out.Report = report
 	out.Report.Accepted = len(out.Records)
+	sc.finalize(&out.Report, len(out.Records), 0)
 	out.Report.Summary = summarize(out.Report)
 	if !opts.Lenient {
 		if err := out.Report.Err(); err != nil {

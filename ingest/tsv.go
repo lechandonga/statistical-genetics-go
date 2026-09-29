@@ -58,17 +58,49 @@ func (e *limitExceeded) Error() string { return "limit exceeded: " + e.what }
 
 // rowScanner 封装带字节/耗时/行数上限的流式扫描。
 type rowScanner struct {
-	r         *bufio.Reader
-	lim       Limits
-	report    *ParseReport
-	deadline  time.Time
-	line      int // 物理行号（表头为 1）
-	header    headerIndex
-	rawCols   []string
-	delim     byte
-	readBytes int64
-	truncated bool
+	r        *bufio.Reader
+	lim      Limits
+	report   *ParseReport
+	deadline time.Time
+	started  time.Time
+	line     int // 物理行号（表头为 1）
+	header   headerIndex
+	rawCols  []string
+	delim    byte
+	cr       *countingReader
 }
+
+// countingReader 统计实际消费字节；MaxFileBytes 在这里强制执行：
+// 用 LimitReader 把可见数据截到 limit+1 字节——
+// 若恰好消费了 limit+1，说明真实文件严格大于上限（超限）；
+// 只消费到 <=limit 则为“恰好在上限内/恰好等于上限”，正常接受。
+// 这样上限恰好等于文件大小时不会误报（无 off-by-one）。
+type countingReader struct {
+	r       io.Reader
+	limit   int64
+	read    int64
+	allowed int64
+}
+
+func newCountingReader(r io.Reader, limit int64) *countingReader {
+	allowed := int64(-1)
+	if limit > 0 {
+		allowed = limit + 1
+	}
+	return &countingReader{r: io.LimitReader(r, allowed), limit: limit, allowed: allowed}
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.read += int64(n)
+	if c.limit > 0 && c.read > c.limit {
+		return n, &limitExceeded{what: "file larger than MaxFileBytes"}
+	}
+	return n, err
+}
+
+// overLimit 在读取结束后报告文件是否严格大于上限。
+func (c *countingReader) overLimit() bool { return c.limit > 0 && c.read > c.limit }
 
 func newRowScanner(r io.Reader, lim Limits, report *ParseReport, delim byte) *rowScanner {
 	def := DefaultLimits()
@@ -85,8 +117,9 @@ func newRowScanner(r io.Reader, lim Limits, report *ParseReport, delim byte) *ro
 	if lim.MaxElapsed > 0 {
 		dl = time.Now().Add(lim.MaxElapsed)
 	}
-	return &rowScanner{r: bufio.NewReaderSize(r, 64*1024), lim: lim,
-		report: report, deadline: dl, delim: delim}
+	cr := newCountingReader(r, lim.MaxFileBytes)
+	return &rowScanner{r: bufio.NewReaderSize(cr, 64*1024), lim: lim,
+		report: report, deadline: dl, delim: delim, started: time.Now(), cr: cr}
 }
 
 // readLine 读取一行（不含行尾），强制执行 MaxLineBytes 与 MaxFileBytes。
@@ -99,6 +132,9 @@ func (s *rowScanner) readLine() ([]byte, error) {
 			return nil, &limitExceeded{what: "line longer than MaxLineBytes at line " + strconv.Itoa(s.line+1)}
 		}
 		if err != nil {
+			if le, ok := err.(*limitExceeded); ok {
+				s.report.Usage.LimitKind = le.what
+			}
 			return buf, err
 		}
 		if !prefix {
@@ -125,6 +161,7 @@ func (s *rowScanner) readHeader() error {
 // next 读取下一数据行，返回字段切片与物理行号；io.EOF 表示结束。
 func (s *rowScanner) next() ([][]byte, int, error) {
 	if !s.deadline.IsZero() && time.Now().After(s.deadline) {
+		s.report.Usage.LimitKind = "MaxElapsed"
 		return nil, s.line, &limitExceeded{what: "MaxElapsed"}
 	}
 	line, err := s.readLine()
@@ -137,16 +174,31 @@ func (s *rowScanner) next() ([][]byte, int, error) {
 		return s.next()
 	}
 	s.report.TotalRows++
+	s.report.Usage.Lines = s.report.TotalRows
 	if s.lim.MaxVariants > 0 && s.report.TotalRows > s.lim.MaxVariants {
 		if s.lim.Policy == LimitTruncate {
-			s.truncated = true
 			s.report.Truncated = true
 			s.report.TruncateAt = s.lim.MaxVariants
+			s.report.Usage.Truncated = true
+			s.report.Usage.LimitKind = "MaxVariants"
 			return nil, s.line, errTruncated
 		}
+		s.report.Usage.LimitKind = "MaxVariants"
 		return nil, s.line, &limitExceeded{what: "MaxVariants"}
 	}
 	return bytes.Split(line, []byte{s.delim}), s.line, nil
+}
+
+// finalize 把扫描器累计的真实用量写回报告（在解析成功/失败两条路径都可调用）。
+func (s *rowScanner) finalize(report *ParseReport, accepted, samples int) {
+	report.Usage.BytesRead = s.cr.read
+	report.Usage.Lines = report.TotalRows
+	report.Usage.Variants = accepted
+	report.Usage.Samples = samples
+	report.Usage.Elapsed = time.Since(s.started)
+	if s.report.Usage.LimitKind == "" && s.cr.limit > 0 && s.cr.read >= s.cr.limit {
+		report.Usage.LimitKind = "MaxFileBytes"
+	}
 }
 
 // field 取字段字符串；越界返回空串。
