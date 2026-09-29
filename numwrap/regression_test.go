@@ -60,13 +60,13 @@ func TestWLSErrors(t *testing.T) {
 	if e, ok := AsError(err); !ok || e.Kind != KindInvalidArgument {
 		t.Fatalf("want invalid_argument got %v", err)
 	}
-	// 不支持的后端必须显式拒绝
+	// 未编译/未知的后端必须显式拒绝，绝不退回默认实现
 	_, err = WLS([]float64{1, 2}, []float64{1, 2},
-		RegressionOptions{InterceptFree: false, Backend: BackendGonum})
+		RegressionOptions{InterceptFree: false, Backend: Backend("atlas")})
 	if e, ok := AsError(err); !ok || e.Kind != KindUnsupportedOption {
 		t.Fatalf("want unsupported_option got %v", err)
 	}
-	t.Logf("[input] mismatch/NaN/negative-weight/gonum-backend [judgement] all mapped to typed numwrap errors")
+	t.Logf("[input] mismatch/NaN/negative-weight/unknown-backend [judgement] all mapped to typed numwrap errors")
 }
 
 func TestKahanAndQuantile(t *testing.T) {

@@ -14,19 +14,23 @@ import (
 	"time"
 
 	"github.com/lechandonga/statistical-genetics-go/ingest"
+	"github.com/lechandonga/statistical-genetics-go/numwrap"
 	"github.com/lechandonga/statistical-genetics-go/stats"
 	"github.com/lechandonga/statistical-genetics-go/variant"
 )
 
 // Config 是流程级配置。
 type Config struct {
-	Limits   ingest.Limits
+	Limits   ingest.Limits // 汇总统计输入上限
+	LDLimits ingest.Limits // LD 分数输入上限（零值 => 与 Limits 相同）
+	GTLimits ingest.Limits // 基因型矩阵输入上限（零值 => 与 Limits 相同）
 	Align    variant.AlignConfig
 	H2       stats.H2Options
 	Meta     stats.MetaOptions
 	PRS      stats.PRSOptions
-	Workers  int           // 全局并行度上限（各阶段取 Min）
-	Deadline time.Duration // 整体墙钟上限；0 表示不限
+	Workers  int             // 全局并行度上限（各阶段取 Min）
+	Deadline time.Duration   // 整体墙钟上限；0 表示不限
+	Backend  numwrap.Backend // 数值后端；空 => numwrap 默认后端
 	// EffectField / FallbackN：汇总统计解析的共享设置。
 	Effect    ingest.EffectField
 	FallbackN float64
@@ -39,8 +43,11 @@ type Config struct {
 // DefaultConfig 返回带保守上限的默认配置（三阶段全开，严格模式）。
 func DefaultConfig() Config {
 	align := variant.DefaultAlignConfig()
+	defLim := ingest.DefaultLimits()
 	return Config{
-		Limits:     ingest.DefaultLimits(),
+		Limits:     defLim,
+		LDLimits:   defLim,
+		GTLimits:   defLim,
 		Align:      align,
 		H2:         stats.H2Options{Align: align, MinVariants: 20, Boundary: stats.H2ReportRaw, Workers: 1},
 		Meta:       stats.MetaOptions{Align: align, Model: stats.MetaFixed, Overlap: stats.OverlapFlag, MinCohorts: 2, Workers: 1},
@@ -51,6 +58,15 @@ func DefaultConfig() Config {
 		EnableMeta: true,
 		EnablePRS:  true,
 		GTEncoding: ingest.GTDosage012,
+	}
+}
+
+func (c *Config) normalized() {
+	if c.LDLimits == (ingest.Limits{}) {
+		c.LDLimits = c.Limits
+	}
+	if c.GTLimits == (ingest.Limits{}) {
+		c.GTLimits = c.Limits
 	}
 }
 
@@ -68,6 +84,9 @@ type SummaryInput struct {
 	N      int
 	// SampleIDPath 可选：每行一个样本 ID，用于队列重叠硬证据。
 	SampleIDPath string
+	// Effect 声明该队列的效应字段类型（默认 EffectBeta）；
+	// 混合来源元分析中只有 Z+N 的队列应显式设为 ingest.EffectZ。
+	Effect ingest.EffectField
 }
 
 // Result 是完整流程输出（成功时为完整快照，失败时为零值 + 错误）。
@@ -101,6 +120,15 @@ func Run(ctx context.Context, in Input, cfg Config) (*Result, error) {
 	if !cfg.EnableH2 && !cfg.EnableMeta && !cfg.EnablePRS {
 		return nil, &pipelineError{stage: "config", err: fmt.Errorf("at least one stage must be enabled")}
 	}
+	cfg.normalized()
+	if cfg.Backend != "" {
+		if _, err := numwrap.ResolveBackend(string(cfg.Backend)); err != nil {
+			return nil, &pipelineError{stage: "config", err: err}
+		}
+		cfg.H2.Backend = cfg.Backend
+		cfg.Meta.Backend = cfg.Backend
+		cfg.PRS.Backend = cfg.Backend
+	}
 	if len(in.Summaries) == 0 {
 		return nil, &pipelineError{stage: "config", err: fmt.Errorf("at least one summary file required")}
 	}
@@ -113,9 +141,10 @@ func Run(ctx context.Context, in Input, cfg Config) (*Result, error) {
 		tbl, err := parseFile(si.Path, func(f *os.File) (*ingest.SummaryTable, error) {
 			return ingest.ParseSummary(f, ingest.SummaryOptions{
 				Source:    si.Path,
-				Effect:    cfg.Effect,
+				Effect:    pickEffect(si.Effect, cfg.Effect),
 				FallbackN: float64(si.N),
 				Limits:    cfg.Limits,
+				Lenient:   false,
 			})
 		})
 		if err != nil {
@@ -153,7 +182,7 @@ func Run(ctx context.Context, in Input, cfg Config) (*Result, error) {
 		}
 		ld, err := parseFile(in.LDScores, func(f *os.File) (*ingest.LDScoreTable, error) {
 			return ingest.ParseLDScores(f, ingest.LDSOptions{
-				Source: in.LDScores, Limits: cfg.Limits,
+				Source: in.LDScores, Limits: cfg.LDLimits,
 			})
 		})
 		if err != nil {
@@ -198,7 +227,7 @@ func Run(ctx context.Context, in Input, cfg Config) (*Result, error) {
 		}
 		gt, err := parseFile(in.Genotypes, func(f *os.File) (*ingest.GenotypeMatrix, error) {
 			return ingest.ParseGenotype(f, ingest.GenotypeOptions{
-				Source: in.Genotypes, Encoding: cfg.GTEncoding, Limits: cfg.Limits,
+				Source: in.Genotypes, Encoding: cfg.GTEncoding, Limits: cfg.GTLimits,
 			})
 		})
 		if err != nil {
@@ -222,6 +251,14 @@ func Run(ctx context.Context, in Input, cfg Config) (*Result, error) {
 }
 
 type parsedTable interface{}
+
+func pickEffect(perInput ingest.EffectField, def ingest.EffectField) ingest.EffectField {
+	// EffectBeta 是零值：每队列未显式设置时沿用流程默认。
+	if perInput == 0 {
+		return def
+	}
+	return perInput
+}
 
 func parseFile[T any](path string, parse func(*os.File) (T, error)) (T, error) {
 	var zero T

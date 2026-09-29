@@ -48,6 +48,9 @@ type H2Options struct {
 	Workers int
 	// Align 控制与 LD 参考的等位基因对齐。
 	Align variant.AlignConfig
+	// Backend 指定本次调用使用的数值后端；空值使用 numwrap 默认后端。
+	// numwrap.BackendCrosscheck 会在统计层对两套后端结论做交叉验证。
+	Backend numwrap.Backend
 }
 
 // H2Flag 以可区分位标记描述估计过程中发生的情况。
@@ -146,6 +149,13 @@ func EstimateH2(ctx context.Context, sum *ingest.SummaryTable, ld *ingest.LDScor
 	if sum == nil || ld == nil {
 		return nil, fmt.Errorf("EstimateH2: nil input table")
 	}
+	if opts.Backend == numwrap.BackendCrosscheck {
+		return crosscheckRun("h2",
+			func(o H2Options, b numwrap.Backend) H2Options { o.Backend = b; return o },
+			compareH2Results,
+			func(o H2Options) (*H2Result, error) { return EstimateH2(ctx, sum, ld, o) },
+			opts)
+	}
 	if opts.H2Max == 0 {
 		opts.H2Max = 1
 	}
@@ -221,7 +231,8 @@ func EstimateH2(ctx context.Context, sum *ingest.SummaryTable, ld *ingest.LDScor
 	for i, m := range matched {
 		xs[i], ys[i], ws[i] = m.x, m.y, m.w
 	}
-	wlsOpts := numwrap.RegressionOptions{Weights: ws, InterceptFree: opts.FreeIntercept}
+	wlsOpts := numwrap.RegressionOptions{Weights: ws, InterceptFree: opts.FreeIntercept,
+		Backend: opts.Backend}
 	if !opts.FreeIntercept {
 		wlsOpts.FixedIntercept = 1
 	}
@@ -260,7 +271,7 @@ func EstimateH2(ctx context.Context, sum *ingest.SummaryTable, ld *ingest.LDScor
 	h2raw := slope * M / nbar
 	h2se := slopeSE * M / nbar
 
-	z95, _ := numwrap.NormalCDFInv(0.975)
+	z95 := quantile975(opts.Backend)
 	res := &H2Result{
 		H2Raw:       h2raw,
 		H2:          h2raw,

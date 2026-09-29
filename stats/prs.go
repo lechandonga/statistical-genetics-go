@@ -45,6 +45,8 @@ type PRSOptions struct {
 	//	"perallele" = 除以每样本实际计入的位点数
 	ScoreScale string
 	Workers    int
+	// Backend 指定数值后端（空=默认；crosscheck=双后端验证）。
+	Backend numwrap.Backend
 }
 
 // PRSVariantAudit 记录每个模型位点的使用情况。
@@ -91,6 +93,13 @@ func (e *prsError) Error() string { return "prs: " + e.what + ": " + e.detail }
 func BuildPRS(ctx context.Context, model *ingest.SummaryTable, gt *ingest.GenotypeMatrix, opts PRSOptions) (*PRSResult, error) {
 	if model == nil || gt == nil {
 		return nil, &prsError{"nil_input", "model and genotype matrix required"}
+	}
+	if opts.Backend == numwrap.BackendCrosscheck {
+		return crosscheckRun("prs",
+			func(o PRSOptions, b numwrap.Backend) PRSOptions { o.Backend = b; return o },
+			comparePRSResults,
+			func(o PRSOptions) (*PRSResult, error) { return BuildPRS(ctx, model, gt, o) },
+			opts)
 	}
 	if opts.Align == (variant.AlignConfig{}) {
 		opts.Align = variant.DefaultAlignConfig()
@@ -258,7 +267,7 @@ func BuildPRS(ctx context.Context, model *ingest.SummaryTable, gt *ingest.Genoty
 			}
 		}
 	case "std":
-		mean, sd, err := numwrap.MeanStd(scores)
+		mean, sd, err := numwrap.MeanStdBackend(scores, opts.Backend)
 		if err != nil {
 			return nil, &prsError{"standardize_failed", err.Error()}
 		}
@@ -305,6 +314,7 @@ func markAuditMissing(a []PRSVariantAudit, id string, n int) []PRSVariantAudit {
 type EvalOptions struct {
 	Phenotype  []float64   // 长度必须等于样本数，不允许 NaN/Inf
 	Covariates [][]float64 // 预留：非空即显式拒绝
+	Backend    numwrap.Backend
 }
 
 // EvalResult 是评分-表型关联评估（简单线性回归 y ~ score）。
@@ -335,7 +345,8 @@ func EvaluatePRS(ctx context.Context, prs *PRSResult, opts EvalOptions) (*EvalRe
 			return nil, &prsError{"non_finite_value", fmt.Sprintf("at index %d", i)}
 		}
 	}
-	fit, err := numwrap.WLS(prs.Scores, opts.Phenotype, numwrap.RegressionOptions{InterceptFree: true})
+	fit, err := numwrap.WLS(prs.Scores, opts.Phenotype, numwrap.RegressionOptions{
+		InterceptFree: true, Backend: opts.Backend})
 	if err != nil {
 		return nil, &prsError{"regression_failed", err.Error()}
 	}
@@ -345,11 +356,11 @@ func EvaluatePRS(ctx context.Context, prs *PRSResult, opts EvalOptions) (*EvalRe
 	p := 2 * normalSurvival(abs(z))
 
 	// R2 = corr^2，用与 WLS 一致的确定性均值/方差。
-	xm, xs, err := numwrap.MeanStd(prs.Scores)
+	xm, xs, err := numwrap.MeanStdBackend(prs.Scores, opts.Backend)
 	if err != nil {
 		return nil, &prsError{"moments_failed", err.Error()}
 	}
-	ym, ys, err := numwrap.MeanStd(opts.Phenotype)
+	ym, ys, err := numwrap.MeanStdBackend(opts.Phenotype, opts.Backend)
 	if err != nil {
 		return nil, &prsError{"moments_failed", err.Error()}
 	}

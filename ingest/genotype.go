@@ -96,6 +96,7 @@ func ParseGenotype(r io.Reader, opts GenotypeOptions) (*GenotypeMatrix, error) {
 
 	report := ParseReport{Source: opts.Source}
 	sc := newRowScanner(r, opts.Limits, &report, delim)
+	defer sc.finish()
 	if err := sc.readHeader(); err != nil {
 		return nil, fmt.Errorf("source=%s: %w", opts.Source, err)
 	}
@@ -132,9 +133,17 @@ func ParseGenotype(r io.Reader, opts GenotypeOptions) (*GenotypeMatrix, error) {
 		return nil, &variant.RejectError{Source: opts.Source, Reason: variant.ReasonMissingField,
 			Detail: "no sample columns detected after annotations"}
 	}
+	report.Usage.SamplesOffered = len(sampleIdx)
 	if opts.Limits.MaxSamples > 0 && len(sampleIdx) > opts.Limits.MaxSamples {
-		return nil, &limitExceeded{what: fmt.Sprintf("sample count %d > MaxSamples %d",
-			len(sampleIdx), opts.Limits.MaxSamples)}
+		if opts.Limits.Policy == LimitTruncate {
+			// 按表头列顺序保留前 MaxSamples 个样本列，确定性截断。
+			sampleIdx = sampleIdx[:opts.Limits.MaxSamples]
+			report.Truncated = true
+			report.TruncateAt = opts.Limits.MaxSamples
+		} else {
+			return nil, &limitExceeded{what: fmt.Sprintf("sample count %d > MaxSamples %d",
+				len(sampleIdx), opts.Limits.MaxSamples)}
+		}
 	}
 
 	out := &GenotypeMatrix{}
@@ -142,6 +151,7 @@ func ParseGenotype(r io.Reader, opts GenotypeOptions) (*GenotypeMatrix, error) {
 		out.SampleIDs = append(out.SampleIDs, sc.rawCols[i])
 	}
 	nS := len(sampleIdx)
+	report.Usage.Samples = nS
 	seen := map[variant.MatchKey]int{}
 
 	for {
@@ -200,8 +210,11 @@ func ParseGenotype(r io.Reader, opts GenotypeOptions) (*GenotypeMatrix, error) {
 		_ = base
 	}
 
+	sc.finish()
 	out.Report = report
 	out.Report.Accepted = len(out.Variants)
+	out.Report.Usage.Samples = nS
+	out.Report.Usage.SamplesOffered = report.Usage.SamplesOffered
 	out.Report.Summary = summarize(out.Report)
 	if !opts.Lenient {
 		if err := out.Report.Err(); err != nil {

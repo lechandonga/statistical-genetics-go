@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -59,14 +60,15 @@ func (e *limitExceeded) Error() string { return "limit exceeded: " + e.what }
 // rowScanner 封装带字节/耗时/行数上限的流式扫描。
 type rowScanner struct {
 	r         *bufio.Reader
+	cr        *countingReader
 	lim       Limits
 	report    *ParseReport
 	deadline  time.Time
+	start     time.Time
 	line      int // 物理行号（表头为 1）
 	header    headerIndex
 	rawCols   []string
 	delim     byte
-	readBytes int64
 	truncated bool
 }
 
@@ -85,8 +87,32 @@ func newRowScanner(r io.Reader, lim Limits, report *ParseReport, delim byte) *ro
 	if lim.MaxElapsed > 0 {
 		dl = time.Now().Add(lim.MaxElapsed)
 	}
-	return &rowScanner{r: bufio.NewReaderSize(r, 64*1024), lim: lim,
+	cr := &countingReader{r: r}
+	return &rowScanner{r: bufio.NewReaderSize(cr, 64*1024), cr: cr, lim: lim,
 		report: report, deadline: dl, delim: delim}
+}
+
+// finish 把累计用量写入报告（在 Parse 结束/失败时调用）。
+func (s *rowScanner) finish() {
+	s.report.Usage.BytesRead = s.cr.n
+	s.report.Usage.LinesRead = s.line
+	s.report.Usage.DataRows = s.report.TotalRows
+	if !s.start.IsZero() {
+		s.report.Usage.Elapsed = time.Since(s.start)
+	}
+	s.report.Usage.Truncated = s.report.Truncated
+}
+
+// countingReader 只统计实际从上游读取的字节数，不缓冲、不改变语义。
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	k, err := c.r.Read(p)
+	c.n += int64(k)
+	return k, err
 }
 
 // readLine 读取一行（不含行尾），强制执行 MaxLineBytes 与 MaxFileBytes。
@@ -95,8 +121,13 @@ func (s *rowScanner) readLine() ([]byte, error) {
 	for {
 		chunk, prefix, err := s.r.ReadLine()
 		buf = append(buf, chunk...)
+		if s.lim.MaxFileBytes > 0 && s.cr.n > s.lim.MaxFileBytes {
+			return nil, &limitExceeded{what: fmt.Sprintf(
+				"file larger than MaxFileBytes (%d) at line %d", s.lim.MaxFileBytes, s.line+1)}
+		}
 		if int64(len(buf)) > s.lim.MaxLineBytes {
-			return nil, &limitExceeded{what: "line longer than MaxLineBytes at line " + strconv.Itoa(s.line+1)}
+			return nil, &limitExceeded{what: "line longer than MaxLineBytes at line " +
+				strconv.Itoa(s.line+1)}
 		}
 		if err != nil {
 			return buf, err
@@ -109,6 +140,7 @@ func (s *rowScanner) readLine() ([]byte, error) {
 
 // readHeader 读取并解析表头行。
 func (s *rowScanner) readHeader() error {
+	s.start = time.Now()
 	row, err := s.readLine()
 	s.line = 1
 	if err != nil {
@@ -122,13 +154,40 @@ func (s *rowScanner) readHeader() error {
 	return nil
 }
 
+// fileLimitHit 统一处理 MaxFileBytes / MaxLineBytes 超限：
+// 拒绝策略返回 limitExceeded；截断策略返回 errTruncated（仅文件字节，
+// 单行过大无论如何都是畸形输入，始终拒绝）。
+func (s *rowScanner) fileLimitHit(what string) error {
+	if what == "MaxFileBytes" && s.lim.Policy == LimitTruncate {
+		s.truncated = true
+		s.report.Truncated = true
+		s.report.TruncateAt = s.report.TotalRows
+		return errTruncated
+	}
+	return &limitExceeded{what: what}
+}
+
 // next 读取下一数据行，返回字段切片与物理行号；io.EOF 表示结束。
 func (s *rowScanner) next() ([][]byte, int, error) {
 	if !s.deadline.IsZero() && time.Now().After(s.deadline) {
+		if s.lim.Policy == LimitTruncate {
+			s.truncated = true
+			s.report.Truncated = true
+			s.report.TruncateAt = s.report.TotalRows
+			return nil, s.line, errTruncated
+		}
 		return nil, s.line, &limitExceeded{what: "MaxElapsed"}
 	}
 	line, err := s.readLine()
 	if err != nil {
+		if le, ok := asLimitError(err); ok {
+			if le.what == "MaxFileBytes" && s.lim.Policy == LimitTruncate {
+				s.truncated = true
+				s.report.Truncated = true
+				s.report.TruncateAt = s.report.TotalRows
+				return nil, s.line, errTruncated
+			}
+		}
 		return nil, s.line, err
 	}
 	s.line++
@@ -137,6 +196,9 @@ func (s *rowScanner) next() ([][]byte, int, error) {
 		return s.next()
 	}
 	s.report.TotalRows++
+	s.report.Usage.BytesRead = s.cr.n
+	s.report.Usage.LinesRead = s.line
+	s.report.Usage.DataRows = s.report.TotalRows
 	if s.lim.MaxVariants > 0 && s.report.TotalRows > s.lim.MaxVariants {
 		if s.lim.Policy == LimitTruncate {
 			s.truncated = true

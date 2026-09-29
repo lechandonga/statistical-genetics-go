@@ -47,6 +47,32 @@ func DefaultLimits() Limits {
 	}
 }
 
+// Usage 是一次解析实际消耗的输入预算（每次 Parse 独立计量，
+// 不使用任何进程级共享状态，因此并发任务互不串扰）。
+type Usage struct {
+	// BytesRead 实际从输入读取的字节数（含表头、被拒绝行与行尾）。
+	BytesRead int64
+	// LinesRead 实际读取的物理行数（含表头；空行计入物理行但不计数据行）。
+	LinesRead int
+	// DataRows 非空数据行计数（接受+拒绝，不含因截断而未读的行）。
+	DataRows int
+	// Samples 基因型矩阵实际采用的样本列数（截断后为保留数）。
+	Samples int
+	// SamplesOffered 基因型表头中检测到的样本列总数（截断前）。
+	SamplesOffered int
+	// Elapsed 解析墙钟耗时。
+	Elapsed time.Duration
+	// Truncated 是否按 LimitTruncate 策略发生过截断。
+	Truncated bool
+}
+
+// Summary 返回面向 CLI/日志的一行用量小结。
+func (u Usage) Summary() string {
+	return fmt.Sprintf("usage: bytes=%d lines=%d dataRows=%d samples=%d/%d elapsed=%s truncated=%v",
+		u.BytesRead, u.LinesRead, u.DataRows, u.Samples, u.SamplesOffered,
+		u.Elapsed.Round(time.Microsecond), u.Truncated)
+}
+
 // RowRef 定位一条被拒绝的输入行。
 type RowRef struct {
 	Line   int
@@ -69,6 +95,7 @@ type ParseReport struct {
 	TruncateAt int      // Policy==LimitTruncate 时保留的行数上限
 	Columns    []string // 识别到的列
 	Summary    string   // 输入摘要（测试日志用）
+	Usage      Usage    // 实际输入用量小结（字节/行/样本/耗时）
 }
 
 // RejectError 将 RowRef 升级为 *variant.RejectError。

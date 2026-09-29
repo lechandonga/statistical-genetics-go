@@ -20,6 +20,7 @@ const (
 	KindNaN                         // 输入或结果出现 NaN
 	KindInf                         // 输入或结果出现 Inf
 	KindNoConvergence               // 迭代未收敛
+	KindBackendMismatch             // 双后端交叉验证结果不一致（含数值与判定字段）
 )
 
 // Error 是数值层唯一对外错误类型。
@@ -47,6 +48,8 @@ func kindName(k ErrorKind) string {
 		return "inf"
 	case KindNoConvergence:
 		return "no_convergence"
+	case KindBackendMismatch:
+		return "backend_mismatch"
 	default:
 		return "unknown"
 	}

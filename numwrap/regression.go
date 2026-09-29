@@ -1,7 +1,18 @@
 package numwrap
 
 import (
+	"fmt"
 	"math"
+)
+
+// 双后端交叉验证的声明容差（见 docs/compatibility.md 与
+// docs/verification.md）。同一后端重复调用必须逐位一致；stdlib 与
+// gonum 之间允许因算法/累加顺序不同产生下列相对/绝对误差：
+//
+//	|a-b| <= max(CrosscheckRelTol*max(|a|,|b|), CrosscheckAbsTol)
+const (
+	CrosscheckRelTol = 1e-9
+	CrosscheckAbsTol = 1e-12
 )
 
 // RegressionOptions 控制加权线性回归。
@@ -32,29 +43,59 @@ func WLS(x, y []float64, opts RegressionOptions) (*RegressionResult, error) {
 	if opts.Backend == "" {
 		opts.Backend = DefaultBackend()
 	}
-	if opts.Backend != BackendStd {
+	if err := validateWLSInputs(x, y, opts); err != nil {
+		return nil, err
+	}
+	switch opts.Backend {
+	case BackendStd:
+		return wlsStd(x, y, opts)
+	case BackendGonum:
+		return wlsGonum(x, y, opts)
+	case BackendCrosscheck:
+		// 两边都成功才比较；任一边失败直接返回该错误（错误分类本身也
+		// 必须一致；输入校验在调用双后端之前已统一完成。
+		o1 := opts
+		o1.Backend = BackendStd
+		r1, err1 := WLS(x, y, o1)
+		o2 := opts
+		o2.Backend = BackendGonum
+		r2, err2 := WLS(x, y, o2)
+		if err1 != nil || err2 != nil {
+			return compareErrors("WLS", err1, err2)
+		}
+		if err := CompareWLSResults(r1, r2); err != nil {
+			return nil, err
+		}
+		// 两边一致时返回 stdlib 的结果：它与 gonum 在声明容差内一致，
+		// 且 stdlib 的逐位确定性是本流程报告值的基准。
+		return r1, nil
+	default:
 		return nil, &Error{Kind: KindUnsupportedOption, Op: "WLS",
 			Detail: "backend not available: " + string(opts.Backend)}
 	}
+}
+
+// validateWLSInputs 是两个后端共享的输入校验，保证同一份非法输入在
+// 两个后端得到完全相同的错误分类。
+func validateWLSInputs(x, y []float64, opts RegressionOptions) error {
 	n := len(x)
 	if n != len(y) {
-		return nil, &Error{Kind: KindInvalidArgument, Op: "WLS",
+		return &Error{Kind: KindInvalidArgument, Op: "WLS",
 			Detail: "x/y length mismatch"}
 	}
 	hasW := len(opts.Weights) > 0
 	if hasW && len(opts.Weights) != n {
-		return nil, &Error{Kind: KindInvalidArgument, Op: "WLS",
+		return &Error{Kind: KindInvalidArgument, Op: "WLS",
 			Detail: "weights length mismatch"}
 	}
 	need := 2
 	if !opts.InterceptFree {
 		need = 1
 	}
-	if n < need+1 { // 自由截距至少需要 2 点（这里要求 n>=3 求残差）；固定至少 2
-		return nil, &Error{Kind: KindInvalidArgument, Op: "WLS",
+	if n < need+1 {
+		return &Error{Kind: KindInvalidArgument, Op: "WLS",
 			Detail: "not enough observations for requested model"}
 	}
-
 	w := func(i int) float64 {
 		if hasW {
 			return opts.Weights[i]
@@ -64,15 +105,27 @@ func WLS(x, y []float64, opts RegressionOptions) (*RegressionResult, error) {
 	for i := 0; i < n; i++ {
 		wi := w(i)
 		if math.IsNaN(x[i]) || math.IsNaN(y[i]) || math.IsNaN(wi) {
-			return nil, &Error{Kind: KindNaN, Op: "WLS", Detail: "NaN in inputs"}
+			return &Error{Kind: KindNaN, Op: "WLS", Detail: "NaN in inputs"}
 		}
 		if math.IsInf(x[i], 0) || math.IsInf(y[i], 0) || math.IsInf(wi, 0) {
-			return nil, &Error{Kind: KindInf, Op: "WLS", Detail: "Inf in inputs"}
+			return &Error{Kind: KindInf, Op: "WLS", Detail: "Inf in inputs"}
 		}
 		if wi < 0 {
-			return nil, &Error{Kind: KindInvalidArgument, Op: "WLS",
+			return &Error{Kind: KindInvalidArgument, Op: "WLS",
 				Detail: "negative weight"}
 		}
+	}
+	return nil
+}
+
+func wlsStd(x, y []float64, opts RegressionOptions) (*RegressionResult, error) {
+	n := len(x)
+	hasW := len(opts.Weights) > 0
+	w := func(i int) float64 {
+		if hasW {
+			return opts.Weights[i]
+		}
+		return 1
 	}
 
 	// 固定截距：对 y' = y - c 做过原点回归。
@@ -195,6 +248,38 @@ func KahanSum(xs []float64) (float64, error) {
 
 // MeanStd 返回均值与（N-1 分母）样本标准差，单遍确定性算法。
 func MeanStd(xs []float64) (mean, std float64, err error) {
+	return MeanStdBackend(xs, DefaultBackend())
+}
+
+// MeanStdBackend 与 MeanStd 相同，但显式指定后端；gonum 后端使用
+// gonum/stat 的矩计算，结果与 stdlib 在声明容差内一致。
+func MeanStdBackend(xs []float64, b Backend) (mean, std float64, err error) {
+	if b == "" {
+		b = DefaultBackend()
+	}
+	switch b {
+	case BackendCrosscheck:
+		m1, s1, e1 := MeanStdBackend(xs, BackendStd)
+		m2, s2, e2 := MeanStdBackend(xs, BackendGonum)
+		if e1 != nil || e2 != nil {
+			if e, ok := compareSimpleErrors("MeanStd", e1, e2); ok {
+				return 0, 0, e
+			}
+			return 0, 0, &Error{Kind: KindBackendMismatch, Op: "MeanStd",
+				Detail: "error classification differs between backends"}
+		}
+		if !withinTol(m1, m2) || !withinTol(s1, s2) {
+			return 0, 0, &Error{Kind: KindBackendMismatch, Op: "MeanStd",
+				Detail: fmtSprintMismatch(m1, s1, m2, s2)}
+		}
+		return m1, s1, nil
+	case BackendGonum:
+		return meanStdGonum(xs)
+	case BackendStd:
+	default:
+		return 0, 0, &Error{Kind: KindUnsupportedOption, Op: "MeanStd",
+			Detail: "backend not available: " + string(b)}
+	}
 	n := len(xs)
 	if n == 0 {
 		return 0, 0, &Error{Kind: KindInvalidArgument, Op: "MeanStd", Detail: "empty"}
@@ -224,6 +309,38 @@ func MeanStd(xs []float64) (mean, std float64, err error) {
 
 // NormalCDFInv 标准正态分位数函数，基于 math.Erfcinv（stdlib，逐平台一致）。
 func NormalCDFInv(p float64) (float64, error) {
+	return NormalCDFInvBackend(p, DefaultBackend())
+}
+
+// NormalCDFInvBackend 显式指定后端的标准正态分位数函数。
+// gonum 使用 distuv.Normal.Quantile；stdlib 使用 -sqrt2*erfcinv(2p)。
+func NormalCDFInvBackend(p float64, b Backend) (float64, error) {
+	if b == "" {
+		b = DefaultBackend()
+	}
+	switch b {
+	case BackendCrosscheck:
+		q1, e1 := NormalCDFInvBackend(p, BackendStd)
+		q2, e2 := NormalCDFInvBackend(p, BackendGonum)
+		if e1 != nil || e2 != nil {
+			if e, ok := compareSimpleErrors("NormalCDFInv", e1, e2); ok {
+				return 0, e
+			}
+			return 0, &Error{Kind: KindBackendMismatch, Op: "NormalCDFInv",
+				Detail: "error classification differs between backends"}
+		}
+		if !withinTol(q1, q2) {
+			return 0, &Error{Kind: KindBackendMismatch, Op: "NormalCDFInv",
+				Detail: fmt.Sprintf("quantile differs: %.17g vs %.17g", q1, q2)}
+		}
+		return q1, nil
+	case BackendGonum:
+		return quantileGonum(p)
+	case BackendStd:
+	default:
+		return 0, &Error{Kind: KindUnsupportedOption, Op: "NormalCDFInv",
+			Detail: "backend not available: " + string(b)}
+	}
 	if math.IsNaN(p) {
 		return 0, &Error{Kind: KindNaN, Op: "NormalCDFInv"}
 	}

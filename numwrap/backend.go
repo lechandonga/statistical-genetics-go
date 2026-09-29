@@ -8,14 +8,37 @@ type Backend string
 const (
 	// BackendStd 使用 Go 标准库 math 实现的自包含后端（默认、无第三方依赖）。
 	BackendStd Backend = "stdlib"
-	// BackendGonum 为预留后端；未编译进当前构建时请求会得到
-	// KindUnsupportedOption 错误，不透出任何第三方包错误。
+	// BackendGonum 使用 gonum/gonum（mat/stat）实现的第三方交叉验证后端。
+	// 版本在 go.mod / vendor/modules.txt 中锁死（见 docs/compatibility.md）。
 	BackendGonum Backend = "gonum"
+	// BackendCrosscheck 不是一个求解器：它在一次调用内分别用 stdlib 与
+	// gonum 求解，并按 CrosscheckTol 比较；数值不一致或判定相关字段
+	// 不一致时返回 KindBackendMismatch 错误，绝不挑一边的结果返回。
+	BackendCrosscheck Backend = "crosscheck"
 )
 
 // backendVersions 记录各后端的兼容版本范围（见 docs/compatibility.md）。
 var backendVersions = map[Backend]string{
-	BackendStd: "go1.25+ (stdlib math, build-tag fixed)",
+	BackendStd:        "go1.25+ (stdlib math, build-tag fixed)",
+	BackendGonum:      "gonum.org/v1/gonum v0.17.0 (vendored)",
+	BackendCrosscheck: "stdlib v0 + gonum.org/v1/gonum v0.17.0 (vendored), compared per call",
+}
+
+// AvailableBackends 返回当前构建实际可用的后端（顺序固定）。
+// crosscheck 始终可用（它是两种真实后端的组合）。
+func AvailableBackends() []Backend {
+	return []Backend{BackendStd, BackendGonum, BackendCrosscheck}
+}
+
+// ResolveBackend 把字符串解析为已编译后端；未知后端返回
+// KindUnsupportedOption，绝不静默回退默认后端。
+func ResolveBackend(s string) (Backend, error) {
+	b := Backend(s)
+	if _, ok := backendVersions[b]; ok {
+		return b, nil
+	}
+	return "", &Error{Kind: KindUnsupportedOption, Op: "ResolveBackend",
+		Detail: "unknown or uncompiled backend: " + s}
 }
 
 var (

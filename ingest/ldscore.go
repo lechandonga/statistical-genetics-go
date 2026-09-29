@@ -50,6 +50,7 @@ func ParseLDScores(r io.Reader, opts LDSOptions) (*LDScoreTable, error) {
 	}
 	report := ParseReport{Source: opts.Source}
 	sc := newRowScanner(r, opts.Limits, &report, delim)
+	defer sc.finish()
 	if err := sc.readHeader(); err != nil {
 		return nil, fmt.Errorf("source=%s: %w", opts.Source, err)
 	}
@@ -90,6 +91,7 @@ func ParseLDScores(r io.Reader, opts LDSOptions) (*LDScoreTable, error) {
 		out.Records = append(out.Records, rec)
 	}
 
+	sc.finish()
 	out.Report = report
 	out.Report.Accepted = len(out.Records)
 	out.Report.Summary = summarize(out.Report)

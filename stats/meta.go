@@ -50,6 +50,8 @@ type MetaOptions struct {
 	Workers int
 	// MinCohorts：每个变体至少需要的有效队列数（默认 2），否则该变体排除。
 	MinCohorts int
+	// Backend 指定本次调用使用的数值后端（空=默认；crosscheck=双后端验证）。
+	Backend numwrap.Backend
 }
 
 // OverlapEvidence 描述一对队列的样本重叠证据。
@@ -80,6 +82,36 @@ type MetaVariant struct {
 	PerCohort     []MetaCohortLine
 }
 
+// ContributionBasis 标明一个队列的效应/SE/权重来自哪种统一口径。
+type ContributionBasis string
+
+const (
+	// BasisBetaSE：队列直接提供 beta 与 SE，SE 直接采用。
+	BasisBetaSE ContributionBasis = "beta_se"
+	// BasisZNEAF：队列仅提供 Z 与样本量 N，且 EAF 已知且在 (0,1)：
+	// 按统一口径换算
+	//
+	//	SE(beta) = 1 / sqrt(2 * N * EAF * (1 - EAF))
+	//	beta     = Z * SE
+	//
+	// （加性剂量 0/1/2 的方差 Var(X)=2p(1-p)）。方向即 Z 的符号。
+	BasisZNEAF ContributionBasis = "z_n_eaf"
+)
+
+// 混合来源队列的可区分排除原因。
+const (
+	// ReasonZMissingN：Z-only 队列缺少换算所需样本量 N。
+	ReasonZMissingN variant.Reason = "z_missing_n"
+	// ReasonZUnorientableMAF：Z-only 队列没有可用 EAF（或 EAF 为 0/1，
+	// 剂量方差为 0），beta 尺度无法确定，禁止参与合并。
+	ReasonZUnorientableMAF variant.Reason = "z_unorientable_maf"
+	// ReasonZInvalid：Z-only 队列的 Z 非有限数值。
+	ReasonZInvalid variant.Reason = "z_invalid"
+	// ReasonContributionNonFinite：换算后的贡献仍为非有限值
+	// （防御性检查：绝不允许“参与了合并但结果无法解释且无标记”）。
+	ReasonContributionNonFinite variant.Reason = "non_finite_contribution"
+)
+
 // MetaCohortLine 记录每个队列对该变体的贡献与对齐依据。
 type MetaCohortLine struct {
 	Cohort      string
@@ -90,6 +122,16 @@ type MetaCohortLine struct {
 	Relation    variant.FlipRelation
 	Excluded    bool
 	Reason      variant.Reason
+	// N 为该队列在该变体上的样本量（审计用）。
+	N float64
+	// Z 为原始 Z 分数（beta/SE 或直接提供），方向审计用。
+	Z float64
+	// EAF 为换算时使用的效应等位基因频率；beta/SE 直接提供时可为 NaN。
+	EAF float64
+	// Basis 标明贡献口径（beta_se / z_n_eaf）；排除的队列为空。
+	Basis ContributionBasis
+	// BasisDetail 为人类可读的换算依据。
+	BasisDetail string
 }
 
 // MetaResult 是元分析输出。
@@ -114,6 +156,13 @@ func (e *metaError) Error() string { return "meta-analysis: " + e.what + ": " + 
 func RunMeta(ctx context.Context, cohorts []Cohort, opts MetaOptions) (*MetaResult, error) {
 	if len(cohorts) == 0 {
 		return nil, &metaError{"no_cohorts", "at least one cohort required"}
+	}
+	if opts.Backend == numwrap.BackendCrosscheck {
+		return crosscheckRun("meta",
+			func(o MetaOptions, b numwrap.Backend) MetaOptions { o.Backend = b; return o },
+			compareMetaResults,
+			func(o MetaOptions) (*MetaResult, error) { return RunMeta(ctx, cohorts, o) },
+			opts)
 	}
 	if opts.Model == MetaRandomREML {
 		return nil, &metaError{"unsupported_model",
@@ -305,9 +354,39 @@ func analyzeVariant(key variant.MatchKey, cohorts []Cohort,
 	var ref *variant.Variant
 	lines := make([]MetaCohortLine, 0, len(cohorts))
 	type contribution struct {
-		beta, se float64
+		beta, se, n, z, eaf float64
+		basis               ContributionBasis
+		detail              string
 	}
 	var contribs []contribution
+
+	// acceptContribution 统一入口：任何参与合并的贡献都必须方向确定
+	// 且 beta/se/权重全部有限，否则以可区分原因排除（绝不静默纳入）。
+	acceptContribution := func(line MetaCohortLine, c contribution) {
+		if c.beta != c.beta || c.se != c.se || c.se <= 0 {
+			line.Excluded = true
+			line.Reason = ReasonContributionNonFinite
+			line.Basis = ""
+			lines = append(lines, line)
+			return
+		}
+		w := 1 / (c.se * c.se)
+		if w != w || w <= 0 {
+			line.Excluded = true
+			line.Reason = ReasonContributionNonFinite
+			line.Basis = ""
+			lines = append(lines, line)
+			return
+		}
+		line.BetaAligned = c.beta
+		line.SE = c.se
+		line.Weight = w
+		line.N, line.Z, line.EAF = c.n, c.z, c.eaf
+		line.Basis = c.basis
+		line.BasisDetail = c.detail
+		lines = append(lines, line)
+		contribs = append(contribs, c)
+	}
 
 	for ci, c := range cohorts {
 		ri, present := perCohortIdx[ci][key]
@@ -331,17 +410,22 @@ func analyzeVariant(key variant.MatchKey, cohorts []Cohort,
 			ref = rec.V
 			line.Relation = variant.RelationNone
 			line.Sign = 1
-			line.BetaAligned = rec.Beta
-			line.SE = rec.SE
-			line.Weight = weightOf(rec)
 			if rec.V.IsAmbiguous() && opts.Align.Ambiguous == variant.AmbiguousReject {
 				line.Excluded = true
 				line.Reason = variant.ReasonAmbiguousStrand
 				lines = append(lines, line)
 				continue
 			}
-			lines = append(lines, line)
-			contribs = append(contribs, contribution{rec.Beta, rec.SE})
+			beta, se, basis, detail, r := deriveContribution(rec, 1)
+			if r != "" {
+				line.Excluded = true
+				line.Reason = r
+				lines = append(lines, line)
+				continue
+			}
+			acceptContribution(line, contribution{
+				beta: beta, se: se, n: rec.N, z: rec.Z, eaf: rec.V.EAF,
+				basis: basis, detail: detail})
 			continue
 		}
 		al, err := variant.Align(ref, rec.V, opts.Align)
@@ -358,12 +442,16 @@ func analyzeVariant(key variant.MatchKey, cohorts []Cohort,
 		}
 		line.Relation = al.Relation
 		line.Sign = al.Sign
-		betaA := rec.Beta * al.Sign
-		line.BetaAligned = betaA
-		line.SE = rec.SE
-		line.Weight = weightOf(rec)
-		lines = append(lines, line)
-		contribs = append(contribs, contribution{betaA, rec.SE})
+		beta, se, basis, detail, r := deriveContribution(rec, al.Sign)
+		if r != "" {
+			line.Excluded = true
+			line.Reason = r
+			lines = append(lines, line)
+			continue
+		}
+		acceptContribution(line, contribution{
+			beta: beta, se: se, n: rec.N, z: rec.Z * al.Sign, eaf: rec.V.EAF,
+			basis: basis, detail: detail})
 	}
 
 	mv := MetaVariant{V: ref, PerCohort: lines}
@@ -394,18 +482,61 @@ func analyzeVariant(key variant.MatchKey, cohorts []Cohort,
 		mv.WeightRandom = wFixed
 	}
 
-	z95, _ := numwrap.NormalCDFInv(0.975)
+	z95 := quantile975(opts.Backend)
 	mv.CI95 = [2]float64{mv.Beta - z95*mv.SE, mv.Beta + z95*mv.SE}
 	mv.P = 2 * normalSurvival(math.Abs(mv.Beta/mv.SE))
 	return mv
 }
 
-func weightOf(rec ingest.SummaryRecord) float64 {
-	if rec.SE == rec.SE && rec.SE > 0 {
-		return 1 / (rec.SE * rec.SE)
+// deriveContribution 把单条汇总统计换算为对齐到参考方向的 (beta, SE)，
+// 并返回口径与人类可读依据；无法参与时返回非空 variant.Reason。
+//
+// 两种来源统一到同一逆方差口径：
+//
+//  1. beta + SE（EffectBeta/EffectOR）：直接采用（beta 已按 sign 变号）；
+//  2. Z-only（EffectZ）：必须有 N；SE 按 2*N*p*(1-p) 反演（p=EAF）。
+//     EAF 缺失或为 0/1 时剂量方差为 0、beta 尺度无法定向，返回
+//     z_unorientable_maf；N 缺失返回 z_missing_n。
+//
+// sign 为对齐符号（±1）：对 Z-only 队列，方向直接随 Z 变号。
+func deriveContribution(rec ingest.SummaryRecord, sign float64) (beta, se float64,
+	basis ContributionBasis, detail string, reason variant.Reason) {
+
+	zOnly := math.IsNaN(rec.SE)
+	if !zOnly {
+		if rec.SE <= 0 || math.IsInf(rec.SE, 0) {
+			return 0, 0, "", "", ReasonContributionNonFinite
+		}
+		b := rec.Beta * sign
+		if math.IsNaN(b) || math.IsInf(b, 0) {
+			return 0, 0, "", "", ReasonContributionNonFinite
+		}
+		return b, rec.SE, BasisBetaSE,
+			fmt.Sprintf("beta=%.6g se=%.6g provided directly; sign=%+v from allele alignment",
+				rec.Beta, rec.SE, sign), ""
 	}
-	// Z-only 队列：无法形成逆方差权重
-	return math.NaN()
+
+	// Z-only 分支
+	if math.IsNaN(rec.Z) || math.IsInf(rec.Z, 0) {
+		return 0, 0, "", "", ReasonZInvalid
+	}
+	if !(rec.N > 0) {
+		return 0, 0, "", "", ReasonZMissingN
+	}
+	p := rec.V.EAF
+	if math.IsNaN(p) || p <= 0 || p >= 1 {
+		return 0, 0, "", "", ReasonZUnorientableMAF
+	}
+	vx := 2 * rec.N * p * (1 - p)
+	se = 1 / math.Sqrt(vx)
+	zAligned := rec.Z * sign
+	beta = zAligned * se
+	if math.IsNaN(beta) || math.IsInf(beta, 0) || math.IsNaN(se) || se <= 0 {
+		return 0, 0, "", "", ReasonContributionNonFinite
+	}
+	return beta, se, BasisZNEAF,
+		fmt.Sprintf("Z=%.6g N=%.0f EAF=%.4f: SE=1/sqrt(2*N*p*(1-p))=%.6g, beta=Z*SE; sign=%+v",
+			rec.Z, rec.N, p, se, sign), ""
 }
 
 // fixedIVW 返回固定效应 beta、SE、总权重、Cochran Q、自由度与 I2。

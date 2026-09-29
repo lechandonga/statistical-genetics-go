@@ -46,9 +46,16 @@ func run(args []string) error {
 	case "prs":
 		return cmdPRS(args[1:])
 	case "version":
-		v, _ := numwrap.Version(numwrap.DefaultBackend())
-		fmt.Printf("sggo dev\ngo-module: github.com/lechandonga/statistical-genetics-go\nnumerical backend: %s (%s)\n",
-			numwrap.DefaultBackend(), v)
+		fmt.Println("sggo dev")
+		fmt.Println("go-module: github.com/lechandonga/statistical-genetics-go")
+		fmt.Printf("default numerical backend: %s\n", numwrap.DefaultBackend())
+		fmt.Println("compiled backends:")
+		for _, b := range numwrap.AvailableBackends() {
+			v, _ := numwrap.Version(b)
+			fmt.Printf("  - %s: %s\n", b, v)
+		}
+		fmt.Printf("crosscheck tolerance: rel=%g abs=%g (same-backend reruns are bit-exact)\n",
+			numwrap.CrosscheckRelTol, numwrap.CrosscheckAbsTol)
 		return nil
 	default:
 		usage()
@@ -98,25 +105,24 @@ func cmdSimulate(args []string) error {
 	return nil
 }
 
-func openSummary(path string, n float64) (*ingest.SummaryTable, error) {
+func openSummary(path string, n float64, lim ingest.Limits, effect ingest.EffectField) (*ingest.SummaryTable, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 	return ingest.ParseSummary(f, ingest.SummaryOptions{
-		Source: path, Effect: ingest.EffectBeta, FallbackN: n,
-		Limits: ingest.DefaultLimits(),
+		Source: path, Effect: effect, FallbackN: n, Limits: lim,
 	})
 }
 
-func openLD(path string) (*ingest.LDScoreTable, error) {
+func openLD(path string, lim ingest.Limits) (*ingest.LDScoreTable, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	return ingest.ParseLDScores(f, ingest.LDSOptions{Source: path, Limits: ingest.DefaultLimits()})
+	return ingest.ParseLDScores(f, ingest.LDSOptions{Source: path, Limits: lim})
 }
 
 func cmdH2(args []string) error {
@@ -127,20 +133,37 @@ func cmdH2(args []string) error {
 	free := fs.Bool("free-intercept", true, "estimate intercept freely")
 	boundary := fs.String("boundary", "report", "report|clamp|reject for h2 outside [0,h2max]")
 	workers := fs.Int("workers", 1, "shard parallelism (results identical to serial)")
+	backend := backendFlag(fs)
+	limFlags := registerLimitFlags(fs, "sum")
+	ldLimFlags := registerLimitFlags(fs, "ld")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *sumPath == "" || *ldPath == "" {
 		return fmt.Errorf("-sum and -ld are required")
 	}
-	sum, err := openSummary(*sumPath, *n)
+	b, err := resolveBackend(*backend)
 	if err != nil {
 		return err
 	}
-	ld, err := openLD(*ldPath)
+	sumLim, err := limFlags.limits()
 	if err != nil {
 		return err
 	}
+	ldLim, err := ldLimFlags.limits()
+	if err != nil {
+		return err
+	}
+	sum, err := openSummary(*sumPath, *n, sumLim, ingest.EffectBeta)
+	if err != nil {
+		return err
+	}
+	ld, err := openLD(*ldPath, ldLim)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr, sum.Report.Usage.Summary())
+	fmt.Fprintln(os.Stderr, ld.Report.Usage.Summary())
 	pol := stats.H2ReportRaw
 	switch *boundary {
 	case "report":
@@ -153,7 +176,7 @@ func cmdH2(args []string) error {
 	}
 	res, err := stats.EstimateH2(context.Background(), sum, ld, stats.H2Options{
 		NBar: *n, FreeIntercept: *free, Boundary: pol,
-		Align: variant.DefaultAlignConfig(), Workers: *workers,
+		Align: variant.DefaultAlignConfig(), Workers: *workers, Backend: b,
 	})
 	if err != nil {
 		return err
@@ -195,22 +218,45 @@ func cmdMeta(args []string) error {
 	fs := flag.NewFlagSet("meta", flag.ContinueOnError)
 	var ins cohortFlag
 	fs.Var(&ins, "in", "cohort input name=path[:sampleIDFile] (repeatable)")
+	var zOnly stringFlag
+	fs.Var(&zOnly, "z", "name of a Z-only cohort (has Z+N but no beta/SE; repeatable)")
 	model := fs.String("model", "fixed", "fixed|random")
 	overlap := fs.String("overlap", "flag", "flag|drop|reject")
 	workers := fs.Int("workers", 1, "parallelism (identical results)")
 	out := fs.String("out", "", "optional output TSV path")
+	auditOut := fs.String("audit-out", "", "optional per-variant/per-cohort audit TSV path")
+	backend := backendFlag(fs)
+	limFlags := registerLimitFlags(fs, "sum")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if len(ins) < 2 {
 		return fmt.Errorf("at least two -in cohorts required")
 	}
+	b, err := resolveBackend(*backend)
+	if err != nil {
+		return err
+	}
+	sumLim, err := limFlags.limits()
+	if err != nil {
+		return err
+	}
+	zSet := map[string]bool{}
+	for _, name := range zOnly {
+		zSet[name] = true
+	}
 	cohorts := make([]stats.Cohort, 0, len(ins))
 	for _, si := range ins {
-		tbl, err := openSummary(si.Path, 0)
+		effect := ingest.EffectBeta
+		if zSet[si.Cohort] {
+			effect = ingest.EffectZ
+		}
+		tbl, err := openSummary(si.Path, 0, sumLim, effect)
 		if err != nil {
 			return fmt.Errorf("cohort %s: %w", si.Cohort, err)
 		}
+		fmt.Fprintf(os.Stderr, "cohort=%s effect=%s %s\n",
+			si.Cohort, effectName(effect), tbl.Report.Usage.Summary())
 		var ids []string
 		if si.SampleIDPath != "" {
 			b, err := os.ReadFile(si.SampleIDPath)
@@ -240,7 +286,8 @@ func cmdMeta(args []string) error {
 		return fmt.Errorf("unsupported overlap policy %q", *overlap)
 	}
 	res, err := stats.RunMeta(context.Background(), cohorts, stats.MetaOptions{
-		Model: m, Overlap: ov, Align: variant.DefaultAlignConfig(), Workers: *workers,
+		Model: m, Overlap: ov, Align: variant.DefaultAlignConfig(),
+		Workers: *workers, Backend: b,
 	})
 	if err != nil {
 		return err
@@ -251,7 +298,16 @@ func cmdMeta(args []string) error {
 			e.CohortA, e.CohortB, e.SharedSamples, e.Jaccard, e.Duplicate)
 	}
 	if *out != "" {
-		return writeMetaTSV(*out, res)
+		if err := writeMetaTSV(*out, res); err != nil {
+			return err
+		}
+		if *auditOut != "" {
+			if err := writeMetaAuditTSV(*auditOut, res); err != nil {
+				return err
+			}
+			fmt.Println("per-cohort audit written to", *auditOut)
+		}
+		return nil
 	}
 	nShow := 5
 	if len(res.Variants) < nShow {
@@ -262,6 +318,17 @@ func cmdMeta(args []string) error {
 		mv := res.Variants[i]
 		fmt.Printf("%s\t%.5g\t%.5g\t%.3g\t%d\t%.3f\t%.3f\t%v\n",
 			mv.V.ID, mv.Beta, mv.SE, mv.P, mv.NCohorts, mv.Q, mv.I2, mv.Excluded)
+		if mv.Excluded {
+			fmt.Printf("  exclude_reason=%s\n", mv.ExcludeReason)
+		}
+		for _, l := range mv.PerCohort {
+			if l.Excluded {
+				fmt.Printf("  cohort=%s EXCLUDED reason=%s\n", l.Cohort, l.Reason)
+			} else {
+				fmt.Printf("  cohort=%s included basis=%s weight=%.4g sign=%g relation=%s\n",
+					l.Cohort, l.Basis, l.Weight, l.Sign, l.Relation)
+			}
+		}
 	}
 	return nil
 }
@@ -272,11 +339,11 @@ func writeMetaTSV(path string, res *stats.MetaResult) error {
 		return err
 	}
 	defer f.Close()
-	fmt.Fprintln(f, "variant\tbeta\tse\tci_low\tci_high\tp\tncohorts\tQ\tdf\tpQ\tI2\ttau2\texcluded")
+	fmt.Fprintln(f, "variant\tbeta\tse\tci_low\tci_high\tp\tncohorts\tQ\tdf\tpQ\tI2\ttau2\texcluded\texclude_reason")
 	for _, mv := range res.Variants {
-		fmt.Fprintf(f, "%s\t%.10g\t%.10g\t%.10g\t%.10g\t%.6g\t%d\t%.6g\t%d\t%.6g\t%.6g\t%.6g\t%v\n",
+		fmt.Fprintf(f, "%s\t%.10g\t%.10g\t%.10g\t%.10g\t%.6g\t%d\t%.6g\t%d\t%.6g\t%.6g\t%.6g\t%v\t%s\n",
 			mv.V.ID, mv.Beta, mv.SE, mv.CI95[0], mv.CI95[1], mv.P, mv.NCohorts,
-			mv.Q, mv.Df, mv.PQ, mv.I2, mv.Tau2, mv.Excluded)
+			mv.Q, mv.Df, mv.PQ, mv.I2, mv.Tau2, mv.Excluded, mv.ExcludeReason)
 	}
 	return nil
 }
@@ -292,16 +359,32 @@ func cmdPRS(args []string) error {
 	pthr := fs.Float64("p", 0, "P-value threshold (0 = no filter)")
 	enc := fs.String("encoding", "012", "012|acgt")
 	out := fs.String("out", "", "output TSV path (required)")
+	backend := backendFlag(fs)
+	sumLimFlags := registerLimitFlags(fs, "sum")
+	gtLimFlags := registerLimitFlags(fs, "gt")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *sumPath == "" || *gtPath == "" || *out == "" {
 		return fmt.Errorf("-sum, -gt and -out are required")
 	}
-	model, err := openSummary(*sumPath, *n)
+	b, err := resolveBackend(*backend)
 	if err != nil {
 		return err
 	}
+	sumLim, err := sumLimFlags.limits()
+	if err != nil {
+		return err
+	}
+	gtLim, err := gtLimFlags.limits()
+	if err != nil {
+		return err
+	}
+	model, err := openSummary(*sumPath, *n, sumLim, ingest.EffectBeta)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr, model.Report.Usage.Summary())
 	f, err := os.Open(*gtPath)
 	if err != nil {
 		return err
@@ -314,11 +397,12 @@ func cmdPRS(args []string) error {
 		return fmt.Errorf("unsupported encoding %q", *enc)
 	}
 	gt, err := ingest.ParseGenotype(f, ingest.GenotypeOptions{
-		Source: *gtPath, Encoding: encoding, Limits: ingest.DefaultLimits()})
+		Source: *gtPath, Encoding: encoding, Limits: gtLim})
 	f.Close()
 	if err != nil {
 		return err
 	}
+	fmt.Fprintln(os.Stderr, gt.Report.Usage.Summary())
 	mp := stats.ModelStrict
 	if *missingModel == "ignore" {
 		mp = stats.ModelIgnore
@@ -333,7 +417,7 @@ func cmdPRS(args []string) error {
 	}
 	res, err := stats.BuildPRS(context.Background(), model, gt, stats.PRSOptions{
 		ScoreScale: *scale, Model: mp, GT: gp, PThreshold: *pthr,
-		Align: variant.DefaultAlignConfig(),
+		Align: variant.DefaultAlignConfig(), Backend: b,
 	})
 	if err != nil {
 		return err

@@ -81,6 +81,7 @@ func ParseSummary(r io.Reader, opts SummaryOptions) (*SummaryTable, error) {
 	}
 	report := ParseReport{Source: opts.Source}
 	sc := newRowScanner(r, opts.Limits, &report, delim)
+	defer sc.finish()
 	if err := sc.readHeader(); err != nil {
 		return nil, fmt.Errorf("source=%s: %w", opts.Source, err)
 	}
@@ -121,6 +122,7 @@ func ParseSummary(r io.Reader, opts SummaryOptions) (*SummaryTable, error) {
 		out.Records = append(out.Records, rec)
 	}
 
+	sc.finish()
 	out.Report = report
 	out.Report.Accepted = len(out.Records)
 	out.Report.Summary = summarize(out.Report)
@@ -357,7 +359,10 @@ func parseSummaryRow(fields [][]byte, line int, c summaryColumns, opts SummaryOp
 	if rec.N == 0 {
 		if opts.FallbackN > 0 {
 			rec.N = opts.FallbackN
-		} else {
+		} else if opts.Effect != EffectZ {
+			// beta/OR 模式下 N 是必填（遗传力回归等下游直接依赖）；
+			// Z-only 模式允许缺 N：该记录在元分析中按统一口径换算时
+			// 会以可区分原因 z_missing_n 被排除（见 stats.deriveContribution）。
 			return SummaryRecord{}, &rowError{id: id, line: line,
 				reason: variant.ReasonMissingField, detail: "sample size N missing and no FallbackN configured"}
 		}

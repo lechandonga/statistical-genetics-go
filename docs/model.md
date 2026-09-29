@@ -104,6 +104,36 @@ se_F   = 1/sqrt(sum(w_i))
 beta 在合并前先对齐到该变体第一个有效队列的方向；对齐失败的队列以
 `PerCohort[i].Excluded=true` + 原因保留，**不静默丢弃**。
 
+### 4.5 混合来源队列：Z-only 队列的统一口径
+
+队列可以只提供 Z 分数与样本量 N（CLI `-z <cohort>`，解析效应模式
+`ingest.EffectZ`），没有 beta 与 SE。这类队列**默认真正参与合并**，
+按下列统一口径把 Z 换算到与 beta/SE 队列相同的逆方差尺度：
+
+```
+Var(X) = 2*N*p*(1-p)          # 加性剂量 0/1/2，p=效应等位基因频率
+SE     = 1 / sqrt(2*N*p*(1-p))
+beta   = Z * SE               # 方向直接取 Z 的符号
+```
+
+- 对齐到参考方向时 `Z_aligned = Z * AlignResult.Sign`，链互换
+  （swap）取负、链翻转不变号，规则与 beta 队列完全相同；
+- 审计字段 `MetaCohortLine.Basis` 标明口径：`beta_se`（直接提供）或
+  `z_n_eaf`（按上式换算），`BasisDetail` 给出 N/p/SE 的完整代入文本；
+- 只有以下情况才排除，并给出可区分原因：
+
+| 原因 | 触发条件 |
+| --- | --- |
+| `z_missing_n` | Z-only 队列连换算所需的样本量 N 也缺失 |
+| `z_unorientable_maf` | EAF 缺失，或 EAF 为 0/1（剂量方差为 0，beta 尺度无法定向） |
+| `z_invalid` | Z 为 NaN/Inf |
+| `non_finite_contribution` | 换算后 beta/SE/权重仍非有限（防御性兜底） |
+
+变体层面参与队列数低于 `MinCohorts` 时仍标记为 `insufficient_cohorts`，
+但每个队列各自的排除原因都在 `PerCohort` 与 `-audit-out` 文件中可见。
+任何“参与了合并”的条目，其 beta/SE/权重都保证有限且带口径标记——
+不允许出现参与了合并、结果不可解释、却没有任何标记的条目。
+
 ### 4.2 异质性
 
 - Cochran Q = Σ w_i (beta_i − beta_F)²，自由度 k−1；
@@ -177,4 +207,35 @@ raw score_j = Σ_i beta_i(aligned) * dosage_ij
 
 - `LimitReject`（默认）：超限整体拒绝，不返回部分接受结果；
 - `LimitTruncate`：截断并在报告中记录 `Truncated/TruncateAt`。
+
+各项的真实语义（实现保证，CLI 按 `sum`/`ld`/`gt` 三类输入分别开放）：
+
+- `MaxFileBytes`：流式读取，**读到超过上限的字节即触发**（不会先把
+  整个文件读进内存再判断）；reject 立即失败且无部分结果，truncate
+  在已读完整行边界结束并返回完整记录；
+- `MaxVariants`：数据行计数（不含表头/空行，含被拒绝行），超限
+  reject/truncate；
+- `MaxSamples`：基因型表头样本列计数；reject 整体失败，truncate 按
+  表头列顺序保留前 N 列，`Usage.Samples/SamplesOffered` 同时给出
+  采用数与实际提供数；
+- `MaxLineBytes`：单行畸形巨长，**无论 truncate 与否都拒绝**
+  （截断一行中间没有安全语义）；
+- `MaxElapsed`：每行读取前检查墙钟；truncate 时同样在完整行边界结束。
+
+每次解析都在 `ParseReport.Usage` 中独立记录：`BytesRead`（实际从
+输入读取的字节数，含表头与被拒绝行）、`LinesRead`（物理行）、
+`DataRows`、`Samples`/`SamplesOffered`、`Elapsed`、`Truncated`；
+计量不使用任何进程级共享状态，并发解析互不串扰。CLI 在每次运行后
+把该小结打到 stderr。
+
 流程级另有 `Config.Deadline` 墙钟上限（context 超时）。
+
+## 8. 数值后端与交叉验证
+
+见 [compatibility.md](compatibility.md) 的“数值/统计后端”一节：
+`stdlib`（默认）与 vendored `gonum v0.17.0` 双后端，`crosscheck`
+元后端按调用运行两边并比较——数值容差 `rel=1e-9, abs=1e-12`，
+判定（拒绝/标记/纳入/排除/原因/符号）必须逐字段一致，对不上即
+`backend_mismatch` 显式报错。后端选择是每次调用独立的，切换默认
+后端不影响正在运行的任务，也不会产生算了一半的状态
+（crosscheck 两边都完整跑完后才比较并返回）。

@@ -5,8 +5,10 @@
 在**等位基因方向不一致、数据缺失、样本重叠**等非理想条件下，给出
 可解释、可复现的结果。
 
-纯 Go 标准库实现（无第三方数值依赖），数值层通过 `numwrap` 对后端
-版本与错误类型做归一化封装。
+数值层 `numwrap` 提供两个后端：自包含的 Go 标准库实现（默认）与
+版本锁定并 vendor 的成熟线代库 `gonum.org/v1/gonum v0.17.0`；
+可按每次调用选择后端，或用 `crosscheck` 在一次调用内跑两边交叉验证
+（数值容差内一致、判定逐字段一致，对不上明确报错）。断网可复现构建。
 
 ## 能力一览
 
@@ -26,15 +28,23 @@
   评分尺度的审计记录。
 - **并发可复现**：确定性分片 + 固定顺序 Kahan 归约，任意并行度结果
   与串行**逐位一致**；`-race` 安全；失败不返回半更新结果。
-- **可配置上限**：变体数、样本数、行/文件字节、墙钟耗时；超限可拒绝
-  或截断，不残留部分统计状态。
+- **双后端交叉验证**：`stdlib` 与 vendored gonum；同后端逐位一致，
+  两后端数值在 `rel=1e-9/abs=1e-12` 内一致，拒绝/标记/纳入等判定必须
+  完全一致；不一致即 `backend_mismatch` 报错，不挑结果。
+- **可配置输入预算**：汇总统计/LD 分数/基因型三类输入分别配置变体数、
+  样本数、行/文件字节、墙钟耗时；超限拒绝或在完整行边界截断，
+  不残留半截结果；每次运行输出字节/行/样本/耗时用量小结，并发互不串。
+- **混合来源元分析**：只有 Z+N（+EAF）的队列按统一口径
+  `SE=1/sqrt(2Np(1-p))`、`beta=Z*SE` 真正参与合并；缺 N、无 EAF
+  （或 EAF=0/1）分别以可区分原因排除；逐队列权重、方向依据与排除原因
+  全部进入审计输出。
 
 ## 包结构
 
 ```
 variant/           统一变体模型、等位基因对齐、拒绝原因代码
 ingest/            TSV 解析（汇总统计/LD 分数/基因型矩阵）、上限与报告
-numwrap/           数值后端归一化（stdlib；gonum 预留为显式不支持）
+numwrap/           数值后端归一化（stdlib + vendored gonum + crosscheck）
 stats/             h2.go 遗传力 / meta.go 元分析 / prs.go 风险评分
                    parallel.go 确定性分片并行
 internal/simulate/ 固定种子的确定性测试数据生成器
@@ -50,6 +60,9 @@ go build -o sggo ./cmd/sggo
 ./sggo simulate -out testdata -variants 500 -samples 300 -overlap 80
 ./sggo h2   -sum testdata/cohort1_sumstats.tsv -ld testdata/ldscores.tsv -n 280
 ./sggo meta -in c1=testdata/cohort1_sumstats.tsv -in c2=testdata/cohort2_sumstats.tsv
+# 双后端交叉验证 / Z-only 队列：
+# ./sggo h2 ... -backend crosscheck
+# ./sggo meta -in c1=beta.tsv -in c2=z.tsv -z c2 -audit-out audit.tsv
 ./sggo prs  -sum testdata/cohort1_sumstats.tsv -gt testdata/genotypes.tsv \
             -n 280 -missing-sites ignore -scale std -out testdata/prs.tsv
 ```
@@ -57,8 +70,8 @@ go build -o sggo ./cmd/sggo
 ## 测试
 
 ```sh
-go vet ./...
-go test ./... -race -count=1
+GOFLAGS=-mod=vendor GOPROXY=off go vet ./...
+GOFLAGS=-mod=vendor GOPROXY=off go test ./... -race -count=1
 ```
 
 测试以边界与异常数据为主（链翻转、模糊位点、负遗传力、队列重叠、
@@ -75,7 +88,8 @@ go test ./... -race -count=1
 
 ## 范围与限制（明确不做）
 
-- 不联网、不读取压缩文件（gzip）/Parquet/VCF；仅本地未压缩 TSV。
+- 运行期不联网、不读取压缩文件（gzip）/Parquet/VCF；仅本地未压缩 TSV。
+  gonum 源码随仓库 vendor，断网可构建/测试。
 - 不实现 LD 分数本身的估计（r² 矩阵计算），LD 分数为输入。
 - 随机效应仅 DL；REML、协变量调整的 PRS 评估、多表型留待后续，
   当前请求这些选项会被显式拒绝。
